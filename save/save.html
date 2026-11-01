@@ -5,6 +5,7 @@
   <title>Save bookmark</title>
   <script src="../common/theme.js"></script>
   <link rel="stylesheet" href="save.css">
+  <link rel="stylesheet" href="../common/folder-picker.css">
 </head>
 <body>
   <form id="form">
@@ -15,6 +16,7 @@
         <span id="pageUrl"></span>
       </div>
     </header>
+    <p id="savedInfo" hidden></p>
 
     <div class="field">
       <label for="name" data-i18n="name">Name</label>
@@ -22,17 +24,18 @@
     </div>
 
     <div class="field">
-      <label for="folder" data-i18n="folder">Folder</label>
-      <div class="folder-row">
-        <select id="folder"></select>
-        <button type="button" id="btnNewFolder" title="New folder" data-i18n-title="newFolder"></button>
+      <div class="label-row">
+        <span class="label" id="folderLabel" data-i18n="folder">Folder</span>
+        <button type="button" id="btnNewFolder" class="link-btn"></button>
       </div>
+      <div id="folderPicker"></div>
       <div class="folder-row" id="newFolderRow" hidden>
         <input id="newFolderName" type="text" placeholder="New folder name" data-i18n-placeholder="folderNamePlaceholder" autocomplete="off">
         <button type="button" id="btnCreateFolder" class="primary" data-i18n="create">Create</button>
       </div>
     </div>
 
+    <p id="error" role="alert" hidden></p>
     <footer>
       <button type="button" id="btnRemove" data-i18n="remove" hidden>Remove</button>
       <span class="spacer"></span>

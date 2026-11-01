@@ -6,6 +6,7 @@
   <title>Mark My Tabs</title>
   <script src="../common/theme.js"></script>
   <link rel="stylesheet" href="manager.css">
+  <link rel="stylesheet" href="../common/folder-picker.css">
 </head>
 <body>
   <div id="app">
@@ -25,6 +26,11 @@
         <button id="btnTreeNewFolder" class="icon-btn sm" title="New folder" data-i18n-title="newFolder"></button>
       </div>
       <div id="tree" role="tree"></div>
+
+      <div class="sidebar-actions">
+        <button id="btnBackup" class="side-item" type="button"></button>
+        <button id="btnHelp" class="side-item" type="button"></button>
+      </div>
 
       <footer id="stats"></footer>
     </aside>
@@ -49,6 +55,8 @@
 
       <div id="tipbar" hidden></div>
 
+      <div id="searchFilters" hidden></div>
+
       <div id="contentHead">
         <div id="breadcrumb"></div>
         <div class="head-row">
@@ -67,6 +75,7 @@
   <div id="ctxMenu" role="menu" hidden></div>
   <div id="modalRoot" hidden></div>
   <div id="toasts" aria-live="polite"></div>
+  <input id="importFile" type="file" accept=".json,.html,.htm" hidden>
 
   <script type="module" src="manager.js"></script>
 </body>

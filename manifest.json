@@ -1,11 +1,25 @@
 {
   "manifest_version": 3,
   "name": "__MSG_extensionName__",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "__MSG_extensionDescription__",
   "default_locale": "en",
-  "minimum_chrome_version": "114",
-  "permissions": ["bookmarks", "favicon", "storage", "activeTab"],
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "bookmarks",
+    "favicon",
+    "storage",
+    "activeTab",
+    "contextMenus",
+    "tabGroups"
+  ],
+  "optional_permissions": [
+    "tabs"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
   "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",
@@ -23,16 +37,24 @@
     }
   },
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "commands": {
     "open-manager": {
-      "suggested_key": { "default": "Alt+B" },
+      "suggested_key": {
+        "default": "Alt+B"
+      },
       "description": "__MSG_openManagerCommand__"
     },
     "save-current": {
-      "suggested_key": { "default": "Alt+M" },
+      "suggested_key": {
+        "default": "Alt+M"
+      },
       "description": "__MSG_saveCurrentCommand__"
     }
+  },
+  "omnibox": {
+    "keyword": "mt"
   }
 }

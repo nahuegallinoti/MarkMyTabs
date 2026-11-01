@@ -1,7 +1,11 @@
 {
-  "extensionName": { "message": "Mark My Tabs" },
-  "extensionDescription": { "message": "Administrador de marcadores rápido y elegante: busca, organiza, arrastra y limpia tus marcadores." },
-  "actionTitle": { "message": "Mark My Tabs" },
-  "openManagerCommand": { "message": "Abrir el administrador de marcadores" },
-  "saveCurrentCommand": { "message": "Guardar o quitar la pestaña actual de marcadores" }
+  "extensionName": {"message": "Mark My Tabs"},
+  "extensionDescription": {"message": "Administrador de marcadores rápido y elegante: busca, organiza, arrastra y limpia tus marcadores."},
+  "actionTitle": {"message": "Mark My Tabs"},
+  "openManagerCommand": {"message": "Abrir el administrador de marcadores"},
+  "saveCurrentCommand": {"message": "Guardar o editar el marcador de la página actual"},
+  "menuSavePage": {"message": "Guardar página en Mark My Tabs…"},
+  "menuSaveLink": {"message": "Guardar enlace en Mark My Tabs…"},
+  "menuSaveTabs": {"message": "Guardar todas las pestañas en una carpeta…"},
+  "omniboxDefault": {"message": "Buscar en tus marcadores de Mark My Tabs"}
 }

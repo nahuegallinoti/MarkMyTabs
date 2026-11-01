@@ -1,8 +1,12 @@
 import {
   $, $$, el, svg, domainOf, fmtNum, timeAgo, fullDate, debounce,
-  tokenize, searchScore, highlight, faviconEl, loadPref, savePref,
-  bm, openUrl, openInWindow, IS_EXT,
+  parseQuery, queryScore, highlight, faviconEl, loadPref, savePref,
+  bm, openUrl, openInWindow, openUrls, IS_EXT, normalizeUrl, bookmarkUrlKey,
+  recentFolders, rememberFolder,
 } from '../common/utils.js';
+import { exportJson, exportHtml, parseBackup, downloadFile } from '../common/backup.js';
+import { folderPicker } from '../common/folder-picker.js';
+import { checkLinks, loadLinkReport, saveLinkReport } from './links.js';
 import {
   applyI18n, getLang, getLocale, languageButtonText, languageButtonTitle, setLang, tr,
 } from '../common/i18n.js';
@@ -19,7 +23,17 @@ const state = {
   items: [],          // nodos renderizados, en orden visual
   limit: 400,
   tipDismissed: loadPref('mp-tip-dismissed', false),
+  searchKind: 'all',
+  searchScope: 'all',
+  pinned: new Set(loadPref('mp-pinned-folders', [])),
+  cleanupTab: loadPref('mp-cleanup-tab', 'dupes'),
 };
+if (state.view.type === 'dupes') state.view = { type: 'cleanup' };
+
+let recentCache = [];
+let linkReport = null;   // último informe de enlaces: { checkedAt, total, problems }
+let linkRun = null;      // revisión en curso: { done, total, problems, cancelled }
+let lastUndo = null;     // { run, dismiss } del último aviso con «Deshacer» (Ctrl+Z)
 
 let tree = null;
 let nodeById = new Map();
@@ -36,6 +50,7 @@ const sorts = () => [
   { id: 'title-desc', label: tr('Name (Z → A)', 'Nombre (Z → A)') },
   { id: 'date-new', label: tr('Newest first', 'Más recientes primero') },
   { id: 'date-old', label: tr('Oldest first', 'Más antiguos primero') },
+  { id: 'domain', label: tr('Site (A → Z)', 'Sitio (A → Z)') },
 ];
 
 // ============ Datos ============
@@ -101,10 +116,7 @@ function collectUrls(folder) {
 }
 
 function urlKey(url) {
-  try {
-    const u = new URL(url);
-    return (u.origin + u.pathname).toLowerCase().replace(/\/$/, '') + u.search;
-  } catch { return url; }
+  return bookmarkUrlKey(url);
 }
 
 function dupeGroups() {
@@ -117,6 +129,25 @@ function dupeGroups() {
   return [...map.values()].filter((g) => g.length > 1).sort((a, b) => b.length - a.length);
 }
 
+// Carpetas sin ningún marcador adentro (solo la más alta de cada rama vacía)
+function emptyFolders() {
+  const out = [];
+  (function w(n) {
+    for (const c of n.children || []) {
+      if (c.url) continue;
+      if (!isRootFolder(c) && !(countsById.get(c.id)?.b)) out.push(c);
+      else w(c);
+    }
+  })(tree);
+  return out;
+}
+
+function noteFolder(id) {
+  if (!id) return;
+  recentCache = [id, ...recentCache.filter(x => x !== id)].slice(0, 8);
+  rememberFolder(id);
+}
+
 function cmpTitle(a, b) {
   return (a.title || '').localeCompare(b.title || '', getLocale(), { sensitivity: 'base' });
 }
@@ -127,6 +158,7 @@ function sortArr(arr, { fallbackDate = false } = {}) {
     case 'title-desc': arr.sort((a, b) => cmpTitle(b, a)); break;
     case 'date-new': arr.sort((a, b) => (b.dateAdded || 0) - (a.dateAdded || 0)); break;
     case 'date-old': arr.sort((a, b) => (a.dateAdded || 0) - (b.dateAdded || 0)); break;
+    case 'domain': arr.sort((a, b) => domainOf(a.url || '').localeCompare(domainOf(b.url || ''), getLocale()) || cmpTitle(a, b)); break;
     default: if (fallbackDate) arr.sort((a, b) => (b.dateAdded || 0) - (a.dateAdded || 0));
   }
   return arr;
@@ -182,7 +214,7 @@ function renderViews() {
   const defs = [
     { id: 'all', label: tr('All bookmarks', 'Todos los marcadores'), icon: 'bookmark', count: fmtNum(total.b) },
     { id: 'recent', label: tr('Recent', 'Recientes'), icon: 'clock' },
-    { id: 'dupes', label: tr('Duplicates', 'Duplicados'), icon: 'copy', badge: extras || null },
+    { id: 'cleanup', label: tr('Cleanup', 'Limpieza'), icon: 'sparkles', badge: extras || null },
   ];
   for (const d of defs) {
     const active = !searching() && state.view.type === d.id;
@@ -193,6 +225,15 @@ function renderViews() {
         : (d.count != null ? el('span', { class: 'count', text: d.count }) : null));
     b.addEventListener('click', () => setView({ type: d.id }));
     wrap.append(b);
+  }
+  const pinned = [...state.pinned].map(id => nodeById.get(id)).filter(n => n && !n.url);
+  if (pinned.length) wrap.append(el('div', { class: 'tree-head', text: tr('Pinned folders', 'Carpetas fijadas') }));
+  for (const folder of pinned) {
+    wrap.append(el('button', {
+      class: `side-item${state.view.folderId === folder.id && !searching() ? ' active' : ''}`,
+      title: folder.title,
+      onClick: () => setView({ type: 'folder', folderId: folder.id }),
+    }, el('span', { class: 'icn', html: svg('pin', 16) }), el('span', { class: 'label', text: folder.title || tr('Untitled', 'Sin nombre') })));
   }
 }
 
@@ -206,6 +247,7 @@ function renderTree() {
     const row = el('div', {
       class: `tree-row${active ? ' active' : ''}`,
       role: 'treeitem', 'aria-expanded': subs.length ? String(isOpen) : null,
+      tabindex: '0', 'aria-selected': String(active), 'aria-level': depth + 1,
       dataset: { id: folder.id },
       style: `padding-left:${6 + depth * 14}px`,
     });
@@ -230,6 +272,22 @@ function renderTree() {
       menuBtn,
     );
     row.addEventListener('click', () => setView({ type: 'folder', folderId: folder.id }));
+    row.addEventListener('keydown', e => {
+      if (e.target !== row) return;
+      const rows = $$('.tree-row', wrap);
+      const index = rows.indexOf(row);
+      if (!['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight', 'Enter', ' ', 'Home', 'End'].includes(e.key)) return;
+      e.preventDefault(); e.stopPropagation();
+      const focusFolder = id => $('#tree [data-id="' + CSS.escape(id) + '"]')?.focus();
+      if (e.key === 'Enter' || e.key === ' ') { setView({ type: 'folder', folderId: folder.id }); focusFolder(folder.id); }
+      else if (e.key === 'ArrowDown') rows[Math.min(rows.length - 1, index + 1)]?.focus();
+      else if (e.key === 'ArrowUp') rows[Math.max(0, index - 1)]?.focus();
+      else if (e.key === 'Home') rows[0]?.focus();
+      else if (e.key === 'End') rows.at(-1)?.focus();
+      else if ((e.key === 'ArrowRight' && subs.length && !isOpen) || (e.key === 'ArrowLeft' && isOpen)) {
+        toggleExpand(folder.id); focusFolder(folder.id);
+      } else if (e.key === 'ArrowLeft') focusFolder(folder.parentId);
+    });
     row.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); showMenu(e.clientX, e.clientY, folderMenuItems(folder)); });
     bindTreeDrop(row, folder);
     wrap.append(row);
@@ -247,6 +305,13 @@ function toggleExpand(id) {
 function bindTreeDrop(row, folder) {
   let expandTimer = null;
   row.addEventListener('dragover', (e) => {
+    if (isLinkDrag(e)) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      clearDropMarkers();
+      row.classList.add('drop-into');
+      return;
+    }
     if (!draggingIds) return;
     if (draggingIds.includes(folder.id)) return;
     if (draggingIds.some((id) => isDescendant(folder.id, id))) return;
@@ -266,6 +331,12 @@ function bindTreeDrop(row, folder) {
     e.preventDefault();
     e.stopPropagation();
     clearTimeout(expandTimer);
+    if (isLinkDrag(e)) {
+      clearDropMarkers();
+      const links = linksFromDrop(e.dataTransfer);
+      if (links.length) addUrls(links, folder.id);
+      return;
+    }
     const ids = draggingIds;
     draggingIds = null;
     clearDropMarkers();
@@ -292,15 +363,38 @@ function setHead({ crumbs = [], title = '', countText = '', actions = [] }) {
 }
 
 // ============ Contenido ============
+function togglePinned(id) {
+  if (state.pinned.has(id)) state.pinned.delete(id); else state.pinned.add(id);
+  savePref('mp-pinned-folders', [...state.pinned]);
+  renderSidebar(); renderContent();
+}
+
+function renderSearchFilters() {
+  const bar = $('#searchFilters');
+  bar.hidden = !searching();
+  bar.replaceChildren();
+  if (!searching()) return;
+  for (const [id, label] of [['all', tr('Everything', 'Todo')], ['bookmarks', tr('Bookmarks', 'Marcadores')], ['folders', tr('Folders', 'Carpetas')]]) {
+    bar.append(el('button', { class: 'filter-chip', 'aria-pressed': String(state.searchKind === id), text: label,
+      onClick: () => { state.searchKind = id; state.limit = 400; clearSelection({ silent: true }); renderContent(); } }));
+  }
+  if (state.view.type === 'folder') {
+    bar.append(el('button', { class: 'filter-chip scope-chip', 'aria-pressed': String(state.searchScope === 'folder'),
+      text: tr('In this folder', 'En esta carpeta'),
+      onClick: () => { state.searchScope = state.searchScope === 'folder' ? 'all' : 'folder'; clearSelection({ silent: true }); renderContent(); } }));
+  }
+}
+
 function renderContent() {
   hideMenu();
+  renderSearchFilters();
   content.innerHTML = '';
   state.items = [];
   state.anchorIndex = null;
   if (searching()) renderSearch();
   else if (state.view.type === 'all') renderAllView();
   else if (state.view.type === 'recent') renderRecentView();
-  else if (state.view.type === 'dupes') renderDupesView();
+  else if (state.view.type === 'cleanup') renderCleanupView();
   else renderFolderView();
   syncSelectionUI();
 }
@@ -310,6 +404,7 @@ function renderFolderView() {
   if (!folder) return;
   const c = countsById.get(folder.id) || { b: 0, f: 0 };
   const actions = [];
+  actions.push(btnGhost('pin', state.pinned.has(folder.id) ? tr('Unpin', 'Desfijar') : tr('Pin folder', 'Fijar carpeta'), () => togglePinned(folder.id)));
   if (c.b > 0) {
     actions.push(btnGhost('external', tr('Open all', 'Abrir todos'), () => openAll(collectUrls(folder))));
   }
@@ -391,15 +486,18 @@ function renderRecentView() {
 }
 
 function renderSearch() {
-  const tokens = tokenize(state.query);
+  const parsed = parseQuery(state.query);
+  const tokens = parsed.tokens;
   const results = [];
   for (const n of nodeById.values()) {
     if (n.id === tree.id) continue;
-    const s = searchScore(n, tokens);
+    if (state.searchKind === 'bookmarks' && !n.url || state.searchKind === 'folders' && n.url) continue;
+    if (state.searchScope === 'folder' && state.view.type === 'folder' && !isDescendant(n.id, state.view.folderId)) continue;
+    const s = queryScore(n, parsed, pathOf(n).map(p => p.title).join(' / '));
     if (s >= 0) results.push([s, n]);
   }
   results.sort((a, b) => b[0] - a[0] || (b[1].dateAdded || 0) - (a[1].dateAdded || 0));
-  const nodes = results.slice(0, 300).map((r) => r[1]);
+  const nodes = results.map((r) => r[1]);
   setHead({
     title: tr('Results', 'Resultados'),
     countText: tr(
@@ -411,16 +509,37 @@ function renderSearch() {
     emptyState({
       icon: 'search',
       title: tr('No results', 'Sin resultados'),
-      msg: tr('Try different words or check the spelling.', 'Prueba con otras palabras o revisa la ortografía.'),
+      msg: tr('Try different words or check the spelling. Tip: site:github.com, in:dev, is:folder, -word.', 'Prueba con otras palabras o revisa la ortografía. Truco: site:github.com, in:dev, is:folder, -palabra.'),
     });
     return;
   }
   renderLimited(nodes, { tokens, showPath: true });
 }
 
-function renderDupesView() {
+// ============ Limpieza: duplicados, carpetas vacías y enlaces rotos ============
+function renderCleanupView() {
   const groups = dupeGroups();
   const extras = groups.reduce((n, g) => n + g.length - 1, 0);
+  const empties = emptyFolders();
+  const problems = linkReport ? linkProblemGroups().reduce((n, g) => n + g.items.length, 0) : null;
+  const tabs = el('div', { class: 'cleanup-tabs', role: 'group', 'aria-label': tr('Cleanup tools', 'Herramientas de limpieza') });
+  for (const [id, label, ic, count] of [
+    ['dupes', tr('Duplicates', 'Duplicados'), 'copy', extras],
+    ['empty', tr('Empty folders', 'Carpetas vacías'), 'folderX', empties.length],
+    ['links', tr('Broken links', 'Enlaces rotos'), 'unlink', linkRun ? '…' : problems],
+  ]) {
+    tabs.append(el('button', {
+      class: 'filter-chip', 'aria-pressed': String(state.cleanupTab === id),
+      onClick: () => { state.cleanupTab = id; savePref('mp-cleanup-tab', id); clearSelection({ silent: true }); renderContent(); },
+    }, el('span', { class: 'icn', html: svg(ic, 13) }), label, count ? el('span', { class: 'chip-count', text: typeof count === 'number' ? fmtNum(count) : count }) : null));
+  }
+  content.append(tabs);
+  if (state.cleanupTab === 'empty') renderEmptyFolders(empties);
+  else if (state.cleanupTab === 'links') renderLinkCheck();
+  else renderDupes(groups, extras);
+}
+
+function renderDupes(groups, extras) {
   const actions = [];
   if (groups.length) {
     const b = el('button', { class: 'btn danger', html: svg('trash', 15) }, tr(` Clean duplicates (${extras})`, ` Limpiar duplicados (${extras})`));
@@ -438,7 +557,7 @@ function renderDupesView() {
     actions.push(b);
   }
   setHead({
-    title: tr('Duplicates', 'Duplicados'),
+    title: tr('Cleanup', 'Limpieza'),
     countText: groups.length ? tr(
       `${fmtNum(groups.length)} ${groups.length === 1 ? 'repeated URL' : 'repeated URLs'} · ${fmtNum(extras)} extra`,
       `${fmtNum(groups.length)} ${groups.length === 1 ? 'URL repetida' : 'URLs repetidas'} · ${fmtNum(extras)} de más`,
@@ -473,6 +592,190 @@ function renderDupesView() {
   }
 }
 
+function renderEmptyFolders(empties) {
+  const actions = [];
+  if (empties.length) {
+    actions.push(el('button', {
+      class: 'btn danger', html: svg('trash', 15),
+      onClick: () => deleteNodes(empties.map(f => f.id), { skipConfirm: true }),
+    }, tr(` Delete empty folders (${empties.length})`, ` Eliminar carpetas vacías (${empties.length})`)));
+  }
+  setHead({
+    title: tr('Cleanup', 'Limpieza'),
+    countText: empties.length ? tr(
+      `${fmtNum(empties.length)} ${empties.length === 1 ? 'folder' : 'folders'} without bookmarks`,
+      `${fmtNum(empties.length)} ${empties.length === 1 ? 'carpeta' : 'carpetas'} sin marcadores`,
+    ) : '',
+    actions,
+  });
+  if (!empties.length) {
+    emptyState({ icon: 'sparkles', title: tr('No empty folders', 'No hay carpetas vacías'), msg: tr('Every folder has at least one bookmark.', 'Todas las carpetas tienen al menos un marcador.') });
+    return;
+  }
+  content.append(el('p', { class: 'cleanup-note', text: tr('These folders (and any subfolders) contain no bookmarks. Deleting them can be undone.', 'Estas carpetas (y sus subcarpetas) no contienen marcadores. Eliminarlas se puede deshacer.') }));
+  const wrap = el('div', { class: 'list' });
+  for (const f of empties) { wrap.append(rowEl(f, { showPath: true })); state.items.push(f); }
+  content.append(wrap);
+}
+
+// Cruza el último informe con los marcadores actuales (los borrados o editados desaparecen solos)
+function linkProblemGroups() {
+  const byKey = new Map();
+  for (const n of allBookmarks) {
+    const k = urlKey(n.url);
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(n);
+  }
+  const groups = { broken: [], redirect: [], unverified: [] };
+  for (const p of linkReport?.problems || []) {
+    for (const node of byKey.get(urlKey(p.url)) || []) groups[p.kind]?.push({ node, problem: p });
+  }
+  return [
+    { kind: 'broken', title: tr('Not found', 'No encontrados'), hint: tr('The page no longer exists or the site does not respond.', 'La página ya no existe o el sitio no responde.'), items: groups.broken },
+    { kind: 'redirect', title: tr('Moved', 'Se mudaron'), hint: tr('The address now redirects somewhere else. You can update it.', 'La dirección ahora redirige a otra. Puedes actualizarla.'), items: groups.redirect },
+    { kind: 'unverified', title: tr('Could not verify', 'No se pudieron verificar'), hint: tr('They may require signing in or block automatic checks. Open them to confirm.', 'Pueden requerir iniciar sesión o bloquear revisiones automáticas. Ábrelos para confirmar.'), items: groups.unverified },
+  ].filter(g => g.items.length);
+}
+
+function problemLabel(p) {
+  if (p.kind === 'redirect') return '→ ' + p.finalUrl;
+  if (p.reason === 'timeout') return tr('No response (timed out)', 'Sin respuesta (tiempo agotado)');
+  if (p.reason === 'network') return tr('Site unreachable or domain not found', 'Sitio inaccesible o dominio inexistente');
+  const names = { 404: tr('Not found', 'No encontrado'), 410: tr('Gone', 'Eliminado'), 401: tr('Sign-in required', 'Requiere iniciar sesión'), 403: tr('Access denied', 'Acceso denegado'), 429: tr('Too many requests', 'Demasiadas solicitudes') };
+  return `${p.status} · ${names[p.status] || (p.status >= 500 ? tr('Server error', 'Error del servidor') : tr('Unexpected response', 'Respuesta inesperada'))}`;
+}
+
+function renderLinkCheck() {
+  const httpCount = new Set(allBookmarks.filter(b => /^https?:/i.test(b.url)).map(b => b.url)).size;
+  if (linkRun) {
+    setHead({
+      title: tr('Cleanup', 'Limpieza'), countText: tr('Checking links…', 'Revisando enlaces…'),
+      actions: [btnGhost('x', tr('Stop', 'Detener'), () => { linkRun.cancelled = true; })],
+    });
+    const pct = linkRun.total ? Math.round((linkRun.done / linkRun.total) * 100) : 0;
+    content.append(el('div', { class: 'link-progress' },
+      el('div', { class: 'lp-text', id: 'linkProgressText', text: progressText() }),
+      el('div', { class: 'lp-bar' }, el('span', { id: 'linkProgressBar', style: `width:${pct}%` })),
+      el('p', { class: 'cleanup-note', text: tr('You can keep using Mark My Tabs while the check runs.', 'Puedes seguir usando Mark My Tabs mientras termina la revisión.') })));
+    return;
+  }
+  const label = linkReport ? tr('Check again', 'Volver a revisar') : tr(`Check ${fmtNum(httpCount)} links`, `Revisar ${fmtNum(httpCount)} enlaces`);
+  const start = btnPrimary('refresh', label, startLinkCheck);
+  if (!httpCount) start.disabled = true;
+  setHead({
+    title: tr('Cleanup', 'Limpieza'),
+    countText: linkReport ? tr(`${fmtNum(linkReport.total)} links checked ${timeAgo(linkReport.checkedAt)}`, `${fmtNum(linkReport.total)} enlaces revisados ${timeAgo(linkReport.checkedAt)}`) : '',
+    actions: [start],
+  });
+  if (!linkReport) {
+    content.append(el('div', { class: 'empty' },
+      el('div', { class: 'art', html: svg('unlink', 34) }),
+      el('h3', { text: tr('Find links that no longer work', 'Encuentra enlaces que ya no funcionan') }),
+      el('p', { text: tr('Mark My Tabs visits each saved address to see whether it still responds. Chrome will ask for permission once. Requests go straight to each site, without cookies, and nothing is sent anywhere else.', 'Mark My Tabs visita cada dirección guardada para ver si sigue respondiendo. Chrome te pedirá permiso una sola vez. Las consultas van directo a cada sitio, sin cookies, y no se envía nada a ningún otro lado.') })));
+    return;
+  }
+  const groups = linkProblemGroups();
+  if (!groups.length) {
+    emptyState({ icon: 'sparkles', title: tr('Every link responds', 'Todos los enlaces responden'), msg: tr('No broken or moved links were found in the last check.', 'La última revisión no encontró enlaces rotos ni mudados.') });
+    return;
+  }
+  for (const g of groups) {
+    const head = el('div', { class: 'link-group-head' },
+      el('div', {}, el('h3', { text: `${g.title} · ${fmtNum(g.items.length)}` }), el('p', { text: g.hint })));
+    if (g.kind === 'broken') {
+      head.append(el('button', { class: 'btn danger', html: svg('trash', 15),
+        onClick: () => deleteNodes(g.items.map(i => i.node.id), { skipConfirm: true }) }, tr(` Delete all (${g.items.length})`, ` Eliminar todos (${g.items.length})`)));
+    }
+    if (g.kind === 'redirect') {
+      head.append(el('button', { class: 'btn', html: svg('refresh', 15), onClick: () => applyRedirects(g.items) }, tr(` Update all (${g.items.length})`, ` Actualizar todos (${g.items.length})`)));
+    }
+    content.append(head);
+    const listWrap = el('div', { class: 'list link-list' });
+    for (const { node, problem } of g.items) {
+      const detail = el('div', { class: `link-detail ${g.kind}` }, el('span', { class: 'why', text: problemLabel(problem), title: problem.finalUrl || '' }));
+      if (g.kind === 'redirect') detail.append(el('button', { class: 'btn ghost sm', text: tr('Use new address', 'Usar nueva dirección'), onClick: () => applyRedirects([{ node, problem }]) }));
+      listWrap.append(el('div', { class: 'link-item' }, rowEl(node, { showPath: true }), detail));
+      state.items.push(node);
+    }
+    content.append(listWrap);
+  }
+}
+
+function progressText() {
+  if (!linkRun) return '';
+  return tr(
+    `Checked ${fmtNum(linkRun.done)} of ${fmtNum(linkRun.total)} · ${fmtNum(linkRun.problems.length)} with problems`,
+    `Revisados ${fmtNum(linkRun.done)} de ${fmtNum(linkRun.total)} · ${fmtNum(linkRun.problems.length)} con problemas`,
+  );
+}
+
+let progressFrame = 0;
+function updateLinkProgress() {
+  if (progressFrame) return;
+  progressFrame = requestAnimationFrame(() => {
+    progressFrame = 0;
+    const text = $('#linkProgressText'), bar = $('#linkProgressBar');
+    if (text) text.textContent = progressText();
+    if (bar && linkRun) bar.style.width = `${Math.round((linkRun.done / Math.max(1, linkRun.total)) * 100)}%`;
+  });
+}
+
+async function startLinkCheck() {
+  if (linkRun) return;
+  // permissions.request debe ejecutarse dentro del gesto del usuario: va primero.
+  if (IS_EXT) {
+    const granted = await chrome.permissions.request({ origins: ['http://*/*', 'https://*/*'] }).catch(() => false);
+    if (!granted) { toast(tr('Link checking needs permission to visit your saved sites.', 'Para revisar enlaces hace falta permiso para visitar tus sitios guardados.'), { kind: 'info', icon: 'info' }); return; }
+  }
+  if (!navigator.onLine) { toast(tr('You seem to be offline. Connect and try again.', 'Parece que no hay conexión. Conéctate y vuelve a intentarlo.'), { kind: 'err', icon: 'alert' }); return; }
+  const urls = [...new Set(allBookmarks.filter(b => /^https?:/i.test(b.url)).map(b => b.url))];
+  const run = { done: 0, total: urls.length, problems: [], cancelled: false };
+  linkRun = run;
+  if (state.view.type === 'cleanup') renderContent();
+  await checkLinks(urls, {
+    mock: !IS_EXT,
+    shouldStop: () => run.cancelled,
+    onResult(url, result) {
+      run.done++;
+      if (result.kind !== 'ok') run.problems.push({ url, ...result });
+      updateLinkProgress();
+    },
+  });
+  linkRun = null;
+  const networkFailures = run.problems.filter(p => p.reason === 'network').length;
+  if (run.done >= 10 && networkFailures / run.done > .9) {
+    toast(tr('Almost no site responded. Check your connection and try again.', 'Casi ningún sitio respondió. Revisa tu conexión y vuelve a intentarlo.'), { kind: 'err', icon: 'alert', duration: 8000 });
+  } else if (!run.cancelled) {
+    linkReport = { checkedAt: Date.now(), total: run.total, problems: run.problems };
+    await saveLinkReport(linkReport);
+    const found = run.problems.length;
+    toast(found
+      ? tr(`Check finished: ${fmtNum(found)} ${found === 1 ? 'link needs' : 'links need'} attention`, `Revisión terminada: ${fmtNum(found)} ${found === 1 ? 'enlace necesita' : 'enlaces necesitan'} atención`)
+      : tr('Check finished: every link responds', 'Revisión terminada: todos los enlaces responden'), {
+      icon: found ? 'unlink' : 'sparkles', duration: 6000,
+      ...(state.view.type !== 'cleanup' ? { actionLabel: tr('View', 'Ver'), onAction: () => { state.cleanupTab = 'links'; setView({ type: 'cleanup' }); } } : {}),
+    });
+  }
+  if (state.view.type === 'cleanup' && !searching()) renderContent();
+}
+
+async function applyRedirects(items) {
+  const done = [];
+  try {
+    for (const { node, problem } of items) {
+      await bm.update(node.id, { url: problem.finalUrl });
+      done.push({ id: node.id, url: node.url });
+    }
+  } catch (err) { toast(errMsg(err), { kind: 'err', icon: 'alert' }); }
+  if (!done.length) return;
+  const fixed = new Set(items.map(i => i.problem.url));
+  linkReport.problems = linkReport.problems.filter(p => !(p.kind === 'redirect' && fixed.has(p.url)));
+  await saveLinkReport(linkReport);
+  toast(done.length === 1 ? tr('Address updated', 'Dirección actualizada') : tr(`${done.length} addresses updated`, `${done.length} direcciones actualizadas`), {
+    icon: 'refresh', undo: async () => { for (const d of done) await bm.update(d.id, { url: d.url }); },
+  });
+}
+
 const sortByAge = (g) => g.slice().sort((a, b) => (a.dateAdded || 0) - (b.dateAdded || 0));
 
 function renderLimited(nodes, opts) {
@@ -491,6 +794,10 @@ function renderItems(container, nodes, opts = {}) {
     state.items.push(n);
   }
   container.append(wrap);
+}
+
+function btnPrimary(iconName, label, onClick) {
+  return el('button', { class: 'btn primary', html: svg(iconName, 15), onClick }, ` ${label}`);
 }
 
 function btnGhost(iconName, label, onClick) {
@@ -635,7 +942,7 @@ function renderBulkbar() {
 }
 
 // ============ Acciones ============
-async function openAll(urls) {
+async function openAll(urls, opts = {}) {
   if (!urls.length) return;
   if (urls.length > 15) {
     const ok = await modalConfirm({
@@ -646,8 +953,68 @@ async function openAll(urls) {
     });
     if (!ok) return;
   }
-  urls.forEach((u) => openUrl(u, { active: false }));
-  toast(`${urls.length} ${urls.length === 1 ? tr('tab opened', 'pestaña abierta') : tr('tabs opened', 'pestañas abiertas')}`, { icon: 'external' });
+  try { await openUrls(urls, opts); }
+  catch (err) { toast(errMsg(err), { kind: 'err', icon: 'alert' }); return; }
+  toast(opts.group
+    ? tr(`Tab group “${opts.group}” opened`, `Grupo de pestañas «${opts.group}» abierto`)
+    : `${urls.length} ${urls.length === 1 ? tr('tab opened', 'pestaña abierta') : tr('tabs opened', 'pestañas abiertas')}`, { icon: opts.group ? 'layers' : 'external' });
+}
+
+// Ordena de verdad la carpeta en Chrome (carpetas primero), con deshacer.
+async function sortFolderByName(folder) {
+  const children = await bm.getChildren(folder.id);
+  const original = children.map(c => c.id);
+  const sorted = [...children.filter(c => !c.url).sort(cmpTitle), ...children.filter(c => c.url).sort(cmpTitle)].map(c => c.id);
+  const name = folder.title || tr('Untitled', 'Sin nombre');
+  if (sorted.every((id, i) => id === original[i])) { toast(tr(`“${name}” is already sorted`, `«${name}» ya está ordenada`), { icon: 'check' }); return; }
+  try { await applyOrder(folder.id, sorted); }
+  catch (err) { toast(errMsg(err), { kind: 'err', icon: 'alert' }); return; }
+  toast(tr(`“${name}” sorted by name`, `«${name}» ordenada por nombre`), { icon: 'sortAZ', undo: () => applyOrder(folder.id, original) });
+}
+
+async function applyOrder(parentId, ids) {
+  const current = new Set((await bm.getChildren(parentId)).map(c => c.id));
+  const order = ids.filter(id => current.has(id));
+  // Recorriendo de arriba hacia abajo cada elemento sube a su lugar, sin el desfase de índices de Chrome.
+  for (let i = 0; i < order.length; i++) await bm.move(order[i], { parentId, index: i });
+}
+
+// Crea marcadores a partir de URLs pegadas o arrastradas desde otra pestaña.
+async function addUrls(items, parentId) {
+  const created = [];
+  try {
+    for (const it of items) created.push((await bm.create({ parentId, title: it.title || domainOf(it.url), url: it.url })).id);
+  } catch (err) { toast(errMsg(err), { kind: 'err', icon: 'alert' }); }
+  if (!created.length) return;
+  const dest = nodeById.get(parentId)?.title || '';
+  toast(created.length === 1
+    ? tr(`Bookmark added to “${dest}”`, `Marcador agregado a «${dest}»`)
+    : tr(`${created.length} bookmarks added to “${dest}”`, `${created.length} marcadores agregados a «${dest}»`), {
+    icon: 'bookmark', undo: async () => { for (const id of created) await bm.remove(id); },
+  });
+}
+
+function urlsFromText(text) {
+  return [...new Set(String(text).split(/\s+/)
+    .filter(s => /^(https?|ftp|file):/i.test(s))
+    .map(s => normalizeUrl(s, { addScheme: false })).filter(Boolean))];
+}
+
+const isLinkDrag = (e) => !draggingIds && [...(e.dataTransfer?.types || [])].includes('text/uri-list');
+
+function linksFromDrop(dt) {
+  const titles = new Map();
+  const html = dt.getData('text/html');
+  if (html) {
+    for (const a of new DOMParser().parseFromString(html, 'text/html').querySelectorAll('a[href]')) {
+      const url = normalizeUrl(a.getAttribute('href'), { addScheme: false });
+      const title = a.textContent.trim().replace(/\s+/g, ' ');
+      if (url && title && !titles.has(url)) titles.set(url, title.slice(0, 500));
+    }
+  }
+  const urls = (dt.getData('text/uri-list') || '').split(/\r?\n/).map(x => x.trim()).filter(x => x && !x.startsWith('#'));
+  return [...new Set(urls.map(u => normalizeUrl(u, { addScheme: false })).filter(Boolean))]
+    .map(url => ({ url, title: titles.get(url) }));
 }
 
 async function copyText(text, msg) {
@@ -657,10 +1024,10 @@ async function copyText(text, msg) {
 
 async function moveNodesTo(ids, parentId, index) {
   const list = topLevelOnly(ids.filter((id) => nodeById.has(id)));
-  if (!list.length) return;
+  if (!list.length) return false;
   if (list.some((id) => isRootFolder(nodeById.get(id)))) {
     toast(tr('Top-level folders cannot be moved', 'Las carpetas principales no se pueden mover'), { kind: 'err', icon: 'alert' });
-    return;
+    return false;
   }
   const records = list.map((id) => {
     const n = nodeById.get(id);
@@ -674,7 +1041,7 @@ async function moveNodesTo(ids, parentId, index) {
     }
   } catch (err) {
     toast(errMsg(err), { kind: 'err', icon: 'alert' });
-    return;
+    return false;
   }
   clearSelection({ silent: true });
   if (!sameParentReorder || records.some((r) => r.parentId !== parentId)) {
@@ -683,16 +1050,16 @@ async function moveNodesTo(ids, parentId, index) {
       `${list.length === 1 ? 'Moved' : `${list.length} items moved`} to “${dest?.title || 'folder'}”`,
       `${list.length === 1 ? 'Movido' : `${list.length} elementos movidos`} a “${dest?.title || 'carpeta'}”`,
     ), {
-      icon: 'folder', actionLabel: tr('Undo', 'Deshacer'), onAction: () => undoMoves(records),
+      icon: 'folder', undo: () => undoMoves(records),
     });
+    noteFolder(parentId);
   }
+  return true;
 }
 
 async function undoMoves(records) {
   const sorted = [...records].sort((a, b) => (a.parentId === b.parentId ? a.index - b.index : 0));
-  try {
-    for (const r of sorted) await bm.move(r.id, { parentId: r.parentId, index: r.index });
-  } catch (err) { toast(errMsg(err), { kind: 'err', icon: 'alert' }); }
+  for (const r of sorted) await bm.move(r.id, { parentId: r.parentId, index: r.index });
 }
 
 async function deleteNodes(ids, { skipConfirm = false } = {}) {
@@ -740,17 +1107,12 @@ async function deleteNodes(ids, { skipConfirm = false } = {}) {
   clearSelection({ silent: true });
   toast(
     list.length === 1 ? tr('Deleted', 'Eliminado') : tr(`${list.length} items deleted`, `${list.length} elementos eliminados`),
-    {
-      icon: 'trash', kind: 'info', actionLabel: tr('Undo', 'Deshacer'), onAction: () => restoreRecords(records),
-    },
+    { icon: 'trash', kind: 'info', undo: () => restoreRecords(records) },
   );
 }
 
 async function restoreRecords(records) {
-  try {
-    for (const r of records) await recreate(r.sub, r.parentId, r.index);
-    toast(tr('Restored', 'Restaurado'), { icon: 'undo' });
-  } catch (err) { toast(errMsg(err), { kind: 'err', icon: 'alert' }); }
+  for (const r of records) await recreate(r.sub, r.parentId, r.index);
 }
 
 async function recreate(node, parentId, index) {
@@ -770,6 +1132,7 @@ let dropMode = null;
 const reorderAllowed = () => !searching() && state.view.type === 'folder' && state.sort === 'manual';
 
 function clearDropMarkers() {
+  content.classList.remove('drop-external');
   for (const x of $$('.drop-into, .drop-marker')) x.classList.remove('drop-into', 'drop-marker', 'before', 'after');
   dropTarget = null;
   dropMode = null;
@@ -796,6 +1159,17 @@ content.addEventListener('dragend', () => {
 });
 
 content.addEventListener('dragover', (e) => {
+  if (isLinkDrag(e)) {
+    const folderEl = e.target.closest?.('[data-id]');
+    const folderNode = folderEl && nodeById.get(folderEl.dataset.id);
+    clearDropMarkers();
+    if (folderNode && !folderNode.url) folderEl.classList.add('drop-into');
+    else if (!searching() && state.view.type === 'folder') content.classList.add('drop-external');
+    else return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    return;
+  }
   if (!draggingIds) return;
   const item = e.target.closest?.('[data-id]');
   clearDropMarkers();
@@ -822,8 +1196,21 @@ content.addEventListener('dragover', (e) => {
   else item.classList.add('drop-marker', mode);
 });
 
+content.addEventListener('dragleave', (e) => {
+  if (!content.contains(e.relatedTarget)) clearDropMarkers();
+});
+
 content.addEventListener('drop', (e) => {
   e.preventDefault();
+  if (isLinkDrag(e)) {
+    const folderEl = e.target.closest?.('[data-id]');
+    const folderNode = folderEl && nodeById.get(folderEl.dataset.id);
+    const parentId = folderNode && !folderNode.url ? folderNode.id : (!searching() && state.view.type === 'folder' ? state.view.folderId : null);
+    clearDropMarkers();
+    const links = linksFromDrop(e.dataTransfer);
+    if (parentId && links.length) addUrls(links, parentId);
+    return;
+  }
   const ids = draggingIds;
   const target = dropTarget;
   const mode = dropMode;
@@ -849,8 +1236,10 @@ async function reorderDrop(ids, targetId, before) {
 
 // ============ Menú contextual ============
 let menuOpen = false;
+let menuReturnFocus = null;
 
 function showMenu(x, y, items) {
+  menuReturnFocus = document.activeElement;
   const menu = $('#ctxMenu');
   menu.innerHTML = '';
   for (const it of items) {
@@ -872,6 +1261,7 @@ function showMenu(x, y, items) {
   const r = menu.getBoundingClientRect();
   menu.style.left = `${Math.max(8, Math.min(x, innerWidth - r.width - 8))}px`;
   menu.style.top = `${Math.max(8, Math.min(y, innerHeight - r.height - 8))}px`;
+  menu.querySelector('button:not(:disabled)')?.focus({ preventScroll: true });
 }
 
 function hideMenu() {
@@ -879,7 +1269,18 @@ function hideMenu() {
   if (menu.hidden) return;
   menu.hidden = true;
   menuOpen = false;
+  if (menu.contains(document.activeElement) && menuReturnFocus?.isConnected) menuReturnFocus.focus({ preventScroll: true });
 }
+
+$('#ctxMenu').addEventListener('keydown', e => {
+  const items = $$('.menu-item:not(:disabled)', $('#ctxMenu'));
+  const index = items.indexOf(document.activeElement);
+  if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) {
+    e.preventDefault(); e.stopPropagation();
+    items[e.key === 'Home' ? 0 : e.key === 'End' ? items.length - 1 : (index + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length]?.focus();
+  }
+  if (e.key === 'Tab') hideMenu();
+});
 
 function bookmarkMenuItems(node) {
   return [
@@ -889,6 +1290,7 @@ function bookmarkMenuItems(node) {
     '-',
     { label: tr('Edit', 'Editar'), icon: 'pen', hint: 'F2', onClick: () => modalBookmark(node) },
     { label: tr('Copy link', 'Copiar enlace'), icon: 'copy', onClick: () => copyText(node.url, tr('Link copied', 'Enlace copiado')) },
+    { label: tr('Copy as Markdown', 'Copiar como Markdown'), icon: 'link', onClick: () => copyText(`[${(node.title || domainOf(node.url)).replace(/[[\]]/g, '\\$&')}](${node.url})`, tr('Markdown link copied', 'Enlace Markdown copiado')) },
     { label: tr('Move to…', 'Mover a…'), icon: 'folder', onClick: () => modalMove([node.id]) },
     '-',
     { label: tr('Delete', 'Eliminar'), icon: 'trash', danger: true, hint: tr('Del', 'Supr'), onClick: () => deleteNodes([node.id]) },
@@ -899,13 +1301,17 @@ function folderMenuItems(node) {
   const isRoot = isRootFolder(node);
   const c = countsById.get(node.id) || { b: 0 };
   return [
+    { label: state.pinned.has(node.id) ? tr('Unpin folder', 'Desfijar carpeta') : tr('Pin folder', 'Fijar carpeta'), icon: 'pin', onClick: () => togglePinned(node.id) },
     { label: tr('Open folder', 'Abrir carpeta'), icon: 'folderOpen', onClick: () => setView({ type: 'folder', folderId: node.id }) },
     { label: tr(`Open all (${fmtNum(c.b)})`, `Abrir todos (${fmtNum(c.b)})`), icon: 'external', disabled: !c.b, onClick: () => openAll(collectUrls(node)) },
+    { label: tr('Open as tab group', 'Abrir como grupo de pestañas'), icon: 'layers', disabled: !c.b, onClick: () => openAll(collectUrls(node), { group: node.title || tr('Bookmarks', 'Marcadores') }) },
+    { label: tr('Open all in new window', 'Abrir todos en ventana nueva'), icon: 'window', disabled: !c.b, onClick: () => openAll(collectUrls(node), { newWindow: true }) },
     '-',
     { label: tr('New bookmark', 'Nuevo marcador'), icon: 'plus', onClick: () => modalBookmark(null, { parentId: node.id }) },
     { label: tr('New subfolder', 'Nueva subcarpeta'), icon: 'folderPlus', onClick: () => modalFolder(null, { parentId: node.id }) },
     '-',
     { label: tr('Rename', 'Renombrar'), icon: 'pen', disabled: isRoot, hint: 'F2', onClick: () => modalFolder(node) },
+    { label: tr('Sort by name', 'Ordenar por nombre'), icon: 'sortAZ', disabled: (node.children || []).length < 2, onClick: () => sortFolderByName(node) },
     { label: tr('Move to…', 'Mover a…'), icon: 'folder', disabled: isRoot, onClick: () => modalMove([node.id]) },
     '-',
     { label: tr('Delete', 'Eliminar'), icon: 'trash', danger: true, disabled: isRoot, hint: tr('Del', 'Supr'), onClick: () => deleteNodes([node.id]) },
@@ -918,6 +1324,8 @@ function multiMenuItems() {
   return [
     { title: tr(`${ids.length} selected`, `${ids.length} seleccionados`) },
     { label: tr('Open all', 'Abrir todos'), icon: 'external', disabled: !urls.length, onClick: () => openAll(urls) },
+    { label: tr('Open as tab group', 'Abrir como grupo de pestañas'), icon: 'layers', disabled: !urls.length, onClick: () => openAll(urls, { group: tr('Bookmarks', 'Marcadores') }) },
+    { label: tr('Open in new window', 'Abrir en ventana nueva'), icon: 'window', disabled: !urls.length, onClick: () => openAll(urls, { newWindow: true }) },
     { label: tr('Move to…', 'Mover a…'), icon: 'folder', onClick: () => modalMove(ids) },
     { label: tr('Copy links', 'Copiar enlaces'), icon: 'copy', disabled: !urls.length, onClick: () => copyText(urls.join('\n'), tr(`${urls.length} links copied`, `${urls.length} enlaces copiados`)) },
     '-',
@@ -936,7 +1344,9 @@ function backgroundMenuItems() {
   return [
     { label: tr('New bookmark', 'Nuevo marcador'), icon: 'plus', onClick: () => modalBookmark(null, { parentId }) },
     { label: tr('New folder', 'Nueva carpeta'), icon: 'folderPlus', onClick: () => modalFolder(null, { parentId }) },
+    { label: tr('Paste link', 'Pegar enlace'), icon: 'link', hint: 'Ctrl+V', onClick: pasteFromClipboard },
     '-',
+    { label: tr('Sort by name', 'Ordenar por nombre'), icon: 'sortAZ', onClick: () => sortFolderByName(nodeById.get(parentId)) },
     { label: tr('Select all', 'Seleccionar todo'), icon: 'check', hint: 'Ctrl+A', onClick: selectAll },
   ];
 }
@@ -945,6 +1355,8 @@ function backgroundMenuItems() {
 let currentModalClose = null;
 
 function openModal({ title, submitLabel, danger = false, build, onSubmit, onClose }) {
+  currentModalClose?.();
+  const returnFocus = document.activeElement;
   const root = $('#modalRoot');
   root.hidden = false;
   root.innerHTML = '';
@@ -955,88 +1367,91 @@ function openModal({ title, submitLabel, danger = false, build, onSubmit, onClos
     root.hidden = true;
     root.innerHTML = '';
     currentModalClose = null;
+    $('#app').inert = false;
+    if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
     onClose?.();
   };
-  currentModalClose = close;
-  const form = el('form', { class: 'modal' });
+  const form = el('form', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'modalTitle' });
+  currentModalClose = () => { if (!form.dataset.busy) close(); };
+  $('#app').inert = true;
   const body = el('div', { class: 'modal-body' });
   build(body, close);
   form.append(
     el('div', { class: 'modal-head' },
-      el('h2', { text: title }),
-      el('button', { type: 'button', class: 'icon-btn', html: svg('x', 16), title: tr('Close (Esc)', 'Cerrar (Esc)'), onClick: close })),
+      el('h2', { id: 'modalTitle', text: title }),
+      el('button', { type: 'button', class: 'icon-btn', html: svg('x', 16), title: tr('Close (Esc)', 'Cerrar (Esc)'), onClick: () => currentModalClose?.() })),
     body,
     el('div', { class: 'modal-foot' },
-      el('button', { type: 'button', class: 'btn', text: tr('Cancel', 'Cancelar'), onClick: close }),
+      el('button', { type: 'button', class: 'btn', text: tr('Cancel', 'Cancelar'), onClick: () => currentModalClose?.() }),
       submitLabel ? el('button', { type: 'submit', class: `btn ${danger ? 'danger' : 'primary'}`, text: submitLabel }) : null),
   );
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const ok = await onSubmit?.();
-    if (ok !== false) close();
+    if (form.dataset.busy) return;
+    form.dataset.busy = 'true';
+    form.setAttribute('aria-busy', 'true');
+    const submit = form.querySelector('[type="submit"]');
+    if (submit) submit.disabled = true;
+    try {
+      const ok = await onSubmit?.();
+      if (ok !== false) close();
+    } catch (err) { toast(errMsg(err), { kind: 'err', icon: 'alert' }); }
+    finally { delete form.dataset.busy; form.removeAttribute('aria-busy'); if (submit) submit.disabled = false; }
   });
   form.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab') {
+      const inputs = [...form.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex="0"]')].filter(n => n.getClientRects().length);
+      const first = inputs[0], last = inputs.at(-1);
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); }
+    }
     if (e.key === 'Enter' && e.target.tagName === 'INPUT') { e.preventDefault(); form.requestSubmit(); }
   });
-  root.addEventListener('mousedown', (e) => { if (e.target === root) close(); });
+  root.onmousedown = e => { if (e.target === root && !form.dataset.busy) close(); };
   root.append(form);
-  setTimeout(() => body.querySelector('input, select')?.focus(), 30);
+  for (const [index, field] of [...body.querySelectorAll('.field')].entries()) {
+    const input = field.querySelector('input, select'), label = field.querySelector('label');
+    if (input && label) { input.id ||= `modalField${index}`; label.htmlFor = input.id; }
+  }
+  (body.querySelector('input, select') || body.querySelector('button') || form.querySelector('button'))?.focus();
   return { close };
 }
 
 const modalOpen = () => currentModalClose != null;
-
-function normalizeUrl(v) {
-  if (!v) return null;
-  try { return new URL(v).href; } catch { /* */ }
-  try {
-    const u = new URL('https://' + v);
-    if (u.hostname.includes('.') || u.hostname === 'localhost') return u.href;
-  } catch { /* */ }
-  return null;
-}
 
 function currentFolderId() {
   if (state.view.type === 'folder' && state.view.folderId) return state.view.folderId;
   return rootFolders[1]?.id ?? rootFolders[0]?.id;
 }
 
-function folderSelect(selectedId, { excludeIds = [] } = {}) {
-  const sel = el('select');
-  const ex = new Set(excludeIds);
-  (function walkF(nodes, depth) {
-    for (const n of nodes) {
-      if (n.url || ex.has(n.id)) continue;
-      sel.append(el('option', { value: n.id, text: '   '.repeat(depth) + (n.title || tr('Untitled', 'Sin nombre')) }));
-      walkF(n.children || [], depth + 1);
-    }
-  })(rootFolders, 0);
-  if (selectedId && sel.querySelector(`option[value="${CSS.escape(selectedId)}"]`)) sel.value = selectedId;
-  return sel;
+function picker(value, opts = {}) {
+  return folderPicker({ roots: rootFolders, value, recent: recentCache, ...opts });
 }
 
-function modalBookmark(node, { parentId } = {}) {
+function modalBookmark(node, { parentId, url: prefillUrl } = {}) {
   const isEdit = !!node;
   let nameI, urlI, folderS, urlField;
   openModal({
     title: isEdit ? tr('Edit bookmark', 'Editar marcador') : tr('New bookmark', 'Nuevo marcador'),
     submitLabel: isEdit ? tr('Save', 'Guardar') : tr('Add', 'Agregar'),
     build(body) {
-      nameI = el('input', { type: 'text', value: node?.title ?? '', placeholder: tr('Bookmark name', 'Nombre del marcador') });
-      urlI = el('input', { type: 'text', value: node?.url ?? '', placeholder: 'https://example.com', spellcheck: 'false' });
+      nameI = el('input', { type: 'text', value: node?.title ?? '', placeholder: prefillUrl ? domainOf(prefillUrl) : tr('Bookmark name', 'Nombre del marcador') });
+      urlI = el('input', { type: 'text', value: node?.url ?? prefillUrl ?? '', placeholder: 'https://example.com', spellcheck: 'false' });
       urlI.addEventListener('input', () => urlField.classList.remove('invalid'));
-      folderS = folderSelect(isEdit ? node.parentId : (parentId ?? currentFolderId()));
+      folderS = picker(isEdit ? node.parentId : (parentId ?? currentFolderId()), { onActivate: () => urlI.form?.requestSubmit() });
       urlField = el('div', { class: 'field' }, el('label', { text: 'URL' }), urlI, el('span', { class: 'err', text: tr('Enter a valid address', 'Ingresa una dirección válida') }));
       body.append(
         el('div', { class: 'field' }, el('label', { text: tr('Name', 'Nombre') }), nameI),
         urlField,
-        el('div', { class: 'field' }, el('label', { text: tr('Folder', 'Carpeta') }), folderS),
+        el('div', { class: 'field' }, el('label', { text: tr('Folder', 'Carpeta') }), folderS.el),
       );
     },
     async onSubmit() {
       const url = normalizeUrl(urlI.value.trim());
       if (!url) { urlField.classList.add('invalid'); urlI.focus(); return false; }
       const title = nameI.value.trim() || domainOf(url);
+      if (!folderS.value) { toast(tr('Choose a folder', 'Elige una carpeta'), { kind: 'info', icon: 'info' }); return false; }
+      noteFolder(folderS.value);
       try {
         if (isEdit) {
           await bm.update(node.id, { title, url });
@@ -1046,7 +1461,7 @@ function modalBookmark(node, { parentId } = {}) {
           await bm.create({ parentId: folderS.value, title, url });
           toast(tr('Bookmark added', 'Marcador agregado'), { icon: 'bookmark' });
         }
-      } catch (err) { toast(errMsg(err), { kind: 'err', icon: 'alert' }); }
+      } catch (err) { toast(errMsg(err), { kind: 'err', icon: 'alert' }); return false; }
     },
   });
 }
@@ -1063,8 +1478,8 @@ function modalFolder(node, { parentId } = {}) {
       nameField = el('div', { class: 'field' }, el('label', { text: tr('Name', 'Nombre') }), nameI, el('span', { class: 'err', text: tr('Enter a name', 'Escribe un nombre') }));
       body.append(nameField);
       if (!isEdit) {
-        parentS = folderSelect(parentId ?? currentFolderId());
-        body.append(el('div', { class: 'field' }, el('label', { text: tr('Inside', 'Dentro de') }), parentS));
+        parentS = picker(parentId ?? currentFolderId(), { onActivate: () => nameI.form?.requestSubmit() });
+        body.append(el('div', { class: 'field' }, el('label', { text: tr('Inside', 'Dentro de') }), parentS.el));
       }
     },
     async onSubmit() {
@@ -1073,12 +1488,13 @@ function modalFolder(node, { parentId } = {}) {
       try {
         if (isEdit) { await bm.update(node.id, { title }); toast(tr('Folder renamed', 'Carpeta renombrada'), { icon: 'check' }); }
         else {
+          if (!parentS.value) { toast(tr('Choose a folder', 'Elige una carpeta'), { kind: 'info', icon: 'info' }); return false; }
           const created = await bm.create({ parentId: parentS.value, title });
           state.expanded.add(parentS.value);
           savePref('mp-expanded', [...state.expanded]);
           toast(tr('Folder created', 'Carpeta creada'), { icon: 'folderPlus', actionLabel: tr('Open', 'Abrir'), onAction: () => setView({ type: 'folder', folderId: created.id }) });
         }
-      } catch (err) { toast(errMsg(err), { kind: 'err', icon: 'alert' }); }
+      } catch (err) { toast(errMsg(err), { kind: 'err', icon: 'alert' }); return false; }
     },
   });
 }
@@ -1092,10 +1508,8 @@ function modalMove(ids) {
     for (const ex of excluded) if (isDescendant(id, ex)) return true;
     return false;
   };
-  let picked = null;
-  let pickedRow = null;
-  const localExpanded = new Set(rootFolders.map((f) => f.id));
   const single = list.length === 1 ? nodeById.get(list[0]) : null;
+  let dest;
 
   openModal({
     title: tr(
@@ -1104,44 +1518,138 @@ function modalMove(ids) {
     ),
     submitLabel: tr('Move here', 'Mover acá'),
     build(body) {
-      const pickWrap = el('div', { class: 'folder-pick' });
-      const render = () => {
-        pickWrap.innerHTML = '';
-        const build = (folder, depth) => {
-          const subs = (folder.children || []).filter((c) => !c.url);
-          const disabled = inExcluded(folder.id);
-          const isOpen = localExpanded.has(folder.id);
-          const row = el('div', {
-            class: `tree-row${picked === folder.id ? ' picked' : ''}`,
-            'aria-disabled': disabled ? 'true' : null,
-            style: `padding-left:${6 + depth * 14}px`,
-          });
-          const twist = el('button', { type: 'button', class: `twist${isOpen ? ' open' : ''}${subs.length ? '' : ' leaf'}`, html: svg('chevron', 13) });
-          twist.addEventListener('click', (e) => {
-            e.stopPropagation();
-            if (localExpanded.has(folder.id)) localExpanded.delete(folder.id); else localExpanded.add(folder.id);
-            render();
-          });
-          row.append(twist, el('span', { class: 'icn', html: svg('folder', 15) }), el('span', { class: 'label', text: folder.title || tr('Untitled', 'Sin nombre') }));
-          row.addEventListener('click', () => {
-            picked = folder.id;
-            pickedRow?.classList.remove('picked');
-            row.classList.add('picked');
-            pickedRow = row;
-          });
-          pickWrap.append(row);
-          if (isOpen) for (const s of subs) build(s, depth + 1);
-        };
-        for (const r of rootFolders) build(r, 0);
-      };
-      render();
-      body.append(el('p', { class: 'msg', text: tr('Choose the destination folder:', 'Elige la carpeta de destino:') }), pickWrap);
+      dest = picker(null, { isDisabled: inExcluded, label: tr('Destination folder', 'Carpeta de destino'), onActivate: () => dest.input.form?.requestSubmit() });
+      body.append(el('p', { class: 'msg', text: tr('Choose the destination folder — type to filter:', 'Elige la carpeta de destino; escribe para filtrar:') }), dest.el);
     },
     async onSubmit() {
-      if (!picked) { toast(tr('Choose a destination folder', 'Elige una carpeta de destino'), { kind: 'info', icon: 'info' }); return false; }
-      await moveNodesTo(list, picked, null);
+      if (!dest.value) { toast(tr('Choose a destination folder', 'Elige una carpeta de destino'), { kind: 'info', icon: 'info' }); return false; }
+      return await moveNodesTo(list, dest.value, null);
     },
   });
+}
+
+// Guarda las pestañas de una ventana en una carpeta nueva. El permiso «tabs» es opcional:
+// se pide solo al usarlo, porque Chrome lo describe como acceso al historial.
+async function modalSaveTabs(windowParam = 'current') {
+  let granted = !IS_EXT || await chrome.permissions.contains({ permissions: ['tabs'] }).catch(() => false);
+  let tabs = [];
+  let body, nameI, dest, listBox, skipI;
+
+  const loadTabs = async () => {
+    if (!IS_EXT) {
+      return [
+        { title: 'MDN — Array.prototype.map()', url: 'https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Array/map' },
+        { title: 'Chrome Extensions — Manifest V3', url: 'https://developer.chrome.com/docs/extensions/mv3/intro/' },
+        { title: 'GitHub', url: 'https://github.com/' },
+        { title: 'Figma', url: 'https://www.figma.com/' },
+      ];
+    }
+    const query = /^\d+$/.test(windowParam) ? { windowId: Number(windowParam) } : { currentWindow: true };
+    let found = await chrome.tabs.query(query).catch(() => []);
+    if (!found.length && query.windowId) found = await chrome.tabs.query({ currentWindow: true });
+    const self = (await chrome.tabs.getCurrent().catch(() => null))?.id;
+    return found
+      .filter(t => t.id !== self && t.url && !/^chrome:\/\/newtab/.test(t.url) && normalizeUrl(t.url, { addScheme: false }))
+      .map(t => ({ title: t.title || t.url, url: t.url }));
+  };
+
+  const renderBody = () => {
+    body.replaceChildren();
+    const submit = $('#modalRoot [type="submit"]');
+    if (!granted) {
+      body.append(el('div', { class: 'import-summary' },
+        el('span', { class: 'icn', html: svg('layers', 24) }),
+        el('div', {}, el('strong', { text: tr('Allow reading your open tabs', 'Permite leer tus pestañas abiertas') }),
+          el('p', { text: tr('Chrome will ask once for permission to see the titles and addresses of your tabs. Mark My Tabs only reads them when you use this action.', 'Chrome te pedirá permiso una sola vez para ver los títulos y direcciones de tus pestañas. Mark My Tabs solo los lee cuando usas esta acción.') }))));
+      if (submit) submit.textContent = tr('Allow and continue', 'Permitir y continuar');
+      return;
+    }
+    if (!tabs.length) {
+      body.append(el('p', { class: 'msg', text: tr('There are no tabs that can be saved in this window.', 'No hay pestañas que se puedan guardar en esta ventana.') }));
+      if (submit) submit.disabled = true;
+      return;
+    }
+    nameI = el('input', { type: 'text', id: 'saveTabsName', maxlength: '200', value: `${tr('Tabs', 'Pestañas')} · ${new Date().toLocaleString(getLocale(), { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}` });
+    dest = picker(currentFolderId());
+    skipI = el('input', { type: 'checkbox' });
+    listBox = el('div', { class: 'tab-list' });
+    const updateCount = () => {
+      const n = $$('input[type="checkbox"]:checked', listBox).length;
+      if (submit) { submit.textContent = tr(`Save ${n} ${n === 1 ? 'tab' : 'tabs'}`, `Guardar ${n} ${n === 1 ? 'pestaña' : 'pestañas'}`); submit.disabled = !n; }
+    };
+    tabs.forEach((t, i) => {
+      const check = el('input', { type: 'checkbox', checked: true, dataset: { i: String(i) }, onChange: updateCount });
+      listBox.append(el('label', { class: 'tab-row', title: t.url }, check, faviconEl(t.url, 16),
+        el('span', { class: 'tab-title', text: t.title }), el('span', { class: 'tab-domain', text: domainOf(t.url) })));
+    });
+    const toggleAll = el('button', { type: 'button', class: 'btn ghost sm', text: tr('Select none', 'Ninguna'), onClick: () => {
+      const all = $$('input[type="checkbox"]', listBox);
+      const on = !all.every(c => c.checked);
+      all.forEach(c => { c.checked = on; });
+      toggleAll.textContent = on ? tr('Select none', 'Ninguna') : tr('Select all', 'Todas');
+      updateCount();
+    } });
+    body.append(
+      el('div', { class: 'field' }, el('label', { text: tr('New folder name', 'Nombre de la nueva carpeta'), for: 'saveTabsName' }), nameI),
+      el('div', { class: 'field' }, el('label', { text: tr('Inside', 'Dentro de') }), dest.el),
+      el('div', { class: 'tab-list-head' }, el('span', { text: tr(`${tabs.length} open ${tabs.length === 1 ? 'tab' : 'tabs'}`, `${tabs.length} ${tabs.length === 1 ? 'pestaña abierta' : 'pestañas abiertas'}`) }), toggleAll),
+      listBox,
+      el('label', { class: 'check-line' }, skipI, tr('Skip pages already saved', 'Omitir páginas ya guardadas')),
+    );
+    updateCount();
+    nameI.focus(); nameI.select();
+  };
+
+  openModal({
+    title: tr('Save open tabs', 'Guardar pestañas abiertas'),
+    submitLabel: tr('Save', 'Guardar'),
+    build(b) { body = b; },
+    async onSubmit() {
+      if (!granted) {
+        // Primera llamada del gesto: Chrome exige que el pedido de permiso venga de un clic.
+        granted = await chrome.permissions.request({ permissions: ['tabs'] }).catch(() => false);
+        if (granted) { tabs = await loadTabs(); renderBody(); }
+        else toast(tr('Permission was not granted', 'No se concedió el permiso'), { kind: 'info', icon: 'info' });
+        return false;
+      }
+      if (!tabs.length) return false;
+      const chosen = $$('input[type="checkbox"]:checked', listBox).map(c => tabs[Number(c.dataset.i)]);
+      const known = new Set(skipI.checked ? allBookmarks.map(n => urlKey(n.url)) : []);
+      const toSave = chosen.filter(t => !known.has(urlKey(t.url)));
+      if (!toSave.length) { toast(tr('All those pages are already saved', 'Todas esas páginas ya están guardadas'), { kind: 'info', icon: 'info' }); return false; }
+      if (!dest.value) { toast(tr('Choose a folder', 'Elige una carpeta'), { kind: 'info', icon: 'info' }); return false; }
+      noteFolder(dest.value);
+      let created;
+      try {
+        created = await bm.create({ parentId: dest.value, title: nameI.value.trim() || tr('Tabs', 'Pestañas') });
+        for (const t of toSave) await bm.create({ parentId: created.id, title: t.title, url: t.url });
+      } catch (err) {
+        if (created) await bm.removeTree(created.id).catch(() => {});
+        throw err;
+      }
+      await refresh();
+      setView({ type: 'folder', folderId: created.id });
+      toast(tr(`${toSave.length} ${toSave.length === 1 ? 'tab saved' : 'tabs saved'}`, `${toSave.length} ${toSave.length === 1 ? 'pestaña guardada' : 'pestañas guardadas'}`), {
+        icon: 'layers', undo: () => bm.removeTree(created.id),
+      });
+    },
+  });
+  if (granted) tabs = await loadTabs();
+  renderBody();
+}
+
+async function pasteFromClipboard() {
+  try { handlePastedText(await navigator.clipboard.readText()); }
+  catch { toast(tr('Press Ctrl+V to paste a link here', 'Pulsa Ctrl+V para pegar un enlace aquí'), { kind: 'info', icon: 'info' }); }
+}
+
+function handlePastedText(text) {
+  const urls = urlsFromText(text);
+  if (!urls.length) { toast(tr('The clipboard has no links', 'El portapapeles no tiene enlaces'), { kind: 'info', icon: 'info' }); return false; }
+  const parentId = currentFolderId();
+  if (urls.length === 1) modalBookmark(null, { parentId, url: urls[0] });
+  else addUrls(urls.map(url => ({ url })), parentId);
+  return true;
 }
 
 function modalConfirm({ title, msg, confirmLabel = tr('Delete', 'Eliminar'), danger = true }) {
@@ -1156,15 +1664,24 @@ function modalConfirm({ title, msg, confirmLabel = tr('Delete', 'Eliminar'), dan
 }
 
 // ============ Toasts ============
-function toast(msg, { icon: ic = 'check', kind = 'ok', actionLabel, onAction, duration } = {}) {
+function toast(msg, { icon: ic = 'check', kind = 'ok', actionLabel, onAction, duration, undo } = {}) {
   const wrap = $('#toasts');
   const t = el('div', { class: 'toast' },
     el('span', { class: `icn ${kind}`, html: svg(ic, 17) }),
     el('span', { class: 'msg', text: msg }));
   const dismiss = () => {
+    if (lastUndo?.toast === t) lastUndo = null;
     t.classList.add('out');
     setTimeout(() => t.remove(), 160);
   };
+  if (undo) {
+    actionLabel = tr('Undo', 'Deshacer');
+    onAction = async () => {
+      try { await undo(); toast(tr('Undone', 'Deshecho'), { icon: 'undo' }); }
+      catch (err) { toast(errMsg(err), { kind: 'err', icon: 'alert' }); }
+    };
+    lastUndo = { toast: t, run: () => { onAction(); dismiss(); } };
+  }
   if (actionLabel) {
     const a = el('button', { class: 'action', text: actionLabel });
     a.addEventListener('click', () => { onAction?.(); dismiss(); });
@@ -1172,7 +1689,7 @@ function toast(msg, { icon: ic = 'check', kind = 'ok', actionLabel, onAction, du
   }
   wrap.append(t);
   while (wrap.children.length > 4) wrap.firstChild.remove();
-  setTimeout(dismiss, duration ?? (actionLabel ? 7000 : 3200));
+  setTimeout(dismiss, duration ?? (undo ? 9000 : actionLabel ? 7000 : 3200));
 }
 
 // ============ Eventos de contenido ============
@@ -1254,7 +1771,7 @@ function gridColumns() {
 }
 
 document.addEventListener('keydown', (e) => {
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); focusSearch(); return; }
+  if (!modalOpen() && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); focusSearch(); return; }
   if (e.key === 'Escape') {
     if (menuOpen) { hideMenu(); return; }
     if (modalOpen()) { currentModalClose(); return; }
@@ -1264,6 +1781,7 @@ document.addEventListener('keydown', (e) => {
     return;
   }
   if (modalOpen()) return;
+  if (menuOpen) return;
   const inInput = /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName);
   if (inInput) {
     if (e.target === searchInput && e.key === 'Enter' && state.items.length) {
@@ -1277,6 +1795,12 @@ document.addEventListener('keydown', (e) => {
   }
   if (e.key === '/') { e.preventDefault(); focusSearch(); return; }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') { e.preventDefault(); selectAll(); return; }
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z') {
+    e.preventDefault();
+    if (lastUndo) lastUndo.run();
+    else toast(tr('Nothing to undo', 'No hay nada para deshacer'), { kind: 'info', icon: 'info' });
+    return;
+  }
   if (e.key === 'Delete') {
     const focused = document.activeElement?.closest?.('[data-id]');
     const ids = state.selection.size ? [...state.selection] : (focused ? [focused.dataset.id] : []);
@@ -1298,6 +1822,14 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+document.addEventListener('paste', (e) => {
+  if (modalOpen() || menuOpen || /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+  const text = e.clipboardData?.getData('text') || '';
+  if (!urlsFromText(text).length) return;
+  e.preventDefault();
+  handlePastedText(text);
+});
+
 // cierre del menú contextual
 document.addEventListener('click', (e) => {
   if (menuOpen && !e.target.closest('#ctxMenu')) { e.preventDefault(); e.stopPropagation(); hideMenu(); }
@@ -1306,6 +1838,119 @@ window.addEventListener('blur', hideMenu);
 window.addEventListener('resize', hideMenu);
 
 // ============ Topbar ============
+function saveBackup(kind, onlyFolder = false) {
+  const folder = onlyFolder && nodeById.get(state.view.folderId);
+  const nodes = folder ? [folder] : rootFolders;
+  const json = kind === 'json';
+  downloadFile(`mark-my-tabs-${new Date().toISOString().slice(0, 10)}.${kind}`,
+    json ? exportJson(nodes) : exportHtml(nodes), json ? 'application/json' : 'text/html;charset=utf-8');
+  toast(tr('Backup exported', 'Respaldo exportado'), { icon: 'download' });
+}
+
+$('#btnBackup').addEventListener('click', () => {
+  const r = $('#btnBackup').getBoundingClientRect();
+  showMenu(r.right + 8, r.top, [
+    { title: tr('Your bookmarks, with you', 'Tus marcadores, contigo') },
+    { label: tr('Export all · JSON backup', 'Exportar todo · Respaldo JSON'), icon: 'download', onClick: () => saveBackup('json') },
+    { label: tr('Export all · Browser HTML', 'Exportar todo · HTML para navegadores'), icon: 'download', onClick: () => saveBackup('html') },
+    ...(state.view.type === 'folder' ? [{ label: tr('Export this folder · HTML', 'Exportar esta carpeta · HTML'), icon: 'folder', onClick: () => saveBackup('html', true) }] : []),
+    '-',
+    { label: tr('Import JSON or HTML…', 'Importar JSON o HTML…'), icon: 'upload', onClick: () => $('#importFile').click() },
+  ]);
+});
+
+$('#importFile').addEventListener('change', async e => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  try {
+    if (file.size > 10 * 1024 * 1024) throw new Error(tr('Choose a file smaller than 10 MB.', 'Elige un archivo de menos de 10 MB.'));
+    const parsed = parseBackup(await file.text(), /\.html?$/i.test(file.name));
+    let destination, name, skip;
+    openModal({
+      title: tr('Import bookmarks', 'Importar marcadores'), submitLabel: tr('Import', 'Importar'),
+      build(body) {
+        body.append(el('div', { class: 'import-summary' },
+          el('span', { class: 'icn', html: svg('upload', 24) }),
+          el('div', {}, el('strong', { text: file.name }), el('p', { text: `${fmtNum(parsed.bookmarks)} ${parsed.bookmarks === 1 ? tr('bookmark', 'marcador') : tr('bookmarks', 'marcadores')} · ${fmtNum(parsed.folders)} ${parsed.folders === 1 ? tr('folder', 'carpeta') : tr('folders', 'carpetas')}` }))));
+        name = el('input', { type: 'text', value: tr('Imported', 'Importados') + ' · ' + new Date().toLocaleDateString(getLocale()), required: true, maxlength: '200' });
+        destination = picker(currentFolderId());
+        skip = el('input', { type: 'checkbox', checked: true });
+        body.append(
+          el('p', { class: 'msg', text: tr('A new folder will keep the imported collection together. Your existing bookmarks stay in place.', 'Una carpeta nueva reunirá la colección importada. Tus marcadores actuales se conservan.') }),
+          el('div', { class: 'field' }, el('label', { text: tr('New folder name', 'Nombre de la nueva carpeta') }), name),
+          el('div', { class: 'field' }, el('label', { text: tr('Destination', 'Destino') }), destination.el),
+          el('label', { class: 'check-line' }, skip, tr('Skip URLs already saved', 'Omitir URLs ya guardadas')),
+        );
+      },
+      async onSubmit() {
+        const known = new Set(skip.checked ? allBookmarks.map(n => urlKey(n.url)) : []);
+        let saved = 0, skipped = 0, created;
+        if (!destination.value) { toast(tr('Choose a folder', 'Elige una carpeta'), { kind: 'info', icon: 'info' }); return false; }
+        noteFolder(destination.value);
+        try {
+          created = await bm.create({ parentId: destination.value, title: name.value.trim() || tr('Imported', 'Importados') });
+          const add = async (nodes, parentId) => {
+            for (const n of nodes) {
+              if (n.url) {
+                const key = urlKey(n.url);
+                if (skip.checked && known.has(key)) { skipped++; continue; }
+                await bm.create({ parentId, title: n.title, url: n.url });
+                known.add(key); saved++;
+              } else {
+                const folder = await bm.create({ parentId, title: n.title });
+                await add(n.children, folder.id);
+              }
+            }
+          };
+          await add(parsed.children, created.id);
+        } catch (err) {
+          if (created) {
+            try { await bm.removeTree(created.id); }
+            catch { throw new Error(tr('Import stopped. Some items remain in the import folder; review it before retrying.', 'La importación se detuvo. Quedan elementos en la carpeta importada; revísala antes de reintentar.')); }
+          }
+          throw err;
+        }
+        await refresh();
+        setView({ type: 'folder', folderId: created.id });
+        toast(tr(`${fmtNum(saved)} ${saved === 1 ? 'bookmark imported' : 'bookmarks imported'} · ${fmtNum(skipped)} skipped`, `${fmtNum(saved)} ${saved === 1 ? 'marcador importado' : 'marcadores importados'} · ${fmtNum(skipped)} ${skipped === 1 ? 'omitido' : 'omitidos'}`), {
+          icon: 'upload', duration: 12000, undo: () => bm.removeTree(created.id),
+        });
+      },
+    });
+  } catch (err) { toast(errMsg(err), { kind: 'err', icon: 'alert' }); }
+});
+
+$('#btnHelp').addEventListener('click', () => openModal({
+  title: tr('Make yourself at home', 'Muévete como en casa'),
+  build(body) {
+    const section = (title) => body.append(el('h3', { class: 'help-title', text: title }));
+    const rows = (list) => { for (const [keys, label] of list) body.append(el('div', { class: 'shortcut-row' }, el('kbd', { text: keys }), el('span', { text: label }))); };
+    section(tr('Keyboard', 'Teclado'));
+    rows([
+      ['Ctrl / ⌘ + K', tr('Search everything, including folder paths', 'Buscar en todo, incluidas rutas de carpetas')],
+      ['Alt + B', tr('Open the manager', 'Abrir el administrador')],
+      ['Alt + M', tr('Save or edit the current page', 'Guardar o editar la página actual')],
+      ['↑ ↓ ← →', tr('Navigate bookmarks and folders', 'Navegar por marcadores y carpetas')],
+      ['Ctrl / ⌘ + A', tr('Select all visible items', 'Seleccionar todos los elementos visibles')],
+      ['F2 / Delete', tr('Edit / delete', 'Editar / eliminar')],
+      ['Ctrl / ⌘ + Z', tr('Undo the last change', 'Deshacer el último cambio')],
+      ['Ctrl / ⌘ + V', tr('Paste links into the current folder', 'Pegar enlaces en la carpeta actual')],
+      ['Esc', tr('Close or clear the current action', 'Cerrar o limpiar la acción actual')],
+    ]);
+    section(tr('Search like a pro', 'Busca como un experto'));
+    rows([
+      ['site:github.com', tr('Only bookmarks from that site', 'Solo marcadores de ese sitio')],
+      ['in:dev', tr('Inside folders whose path contains “dev”', 'Dentro de carpetas cuya ruta contiene «dev»')],
+      ['is:folder', tr('Only folders (or is:bookmark)', 'Solo carpetas (o is:bookmark)')],
+      [tr('-word', '-palabra'), tr('Exclude results with that word', 'Excluir resultados con esa palabra')],
+      [tr('"exact phrase"', '"frase exacta"'), tr('Match the words together', 'Buscar las palabras juntas')],
+      ['mt + Space', tr('Search from Chrome’s address bar', 'Buscar desde la barra de direcciones de Chrome')],
+    ]);
+    body.append(el('p', { class: 'msg', text: tr('Drag links from any page onto a folder to save them, right-click a page to save it, and use Cleanup to remove duplicates, empty folders and broken links.', 'Arrastra enlaces desde cualquier página hasta una carpeta para guardarlos, haz clic derecho en una página para guardarla y usa Limpieza para quitar duplicados, carpetas vacías y enlaces rotos.') }));
+  },
+}));
+
 function applyLayoutBtn() {
   $('#btnLayout').innerHTML = svg(state.layout === 'grid' ? 'list' : 'grid', 17);
   $('#btnLayout').title = state.layout === 'grid' ? tr('View as list', 'Ver como lista') : tr('View as grid', 'Ver como cuadrícula');
@@ -1357,6 +2002,9 @@ $('#btnAdd').addEventListener('click', () => {
   showMenu(r.right - 210, r.bottom + 6, [
     { label: tr('New bookmark', 'Nuevo marcador'), icon: 'plus', onClick: () => modalBookmark(null, {}) },
     { label: tr('New folder', 'Nueva carpeta'), icon: 'folderPlus', onClick: () => modalFolder(null, {}) },
+    '-',
+    { label: tr('Save open tabs…', 'Guardar pestañas abiertas…'), icon: 'layers', onClick: () => modalSaveTabs() },
+    { label: tr('Paste link', 'Pegar enlace'), icon: 'link', hint: 'Ctrl+V', onClick: pasteFromClipboard },
   ]);
 });
 
@@ -1401,6 +2049,9 @@ async function init() {
   $('#btnClearSearch').innerHTML = svg('x', 14);
   $('#searchWrap .search-icn').innerHTML = svg('search', 16);
   $('#btnAdd').innerHTML = `${svg('plus', 16)}<span>${tr('Add', 'Agregar')}</span>`;
+  $('#btnBackup').innerHTML = `<span class="icn">${svg('download', 17)}</span><span>${tr('Backups & import', 'Respaldos e importación')}</span>`;
+  $('#btnHelp').innerHTML = `<span class="icn">${svg('info', 17)}</span><span>${tr('Shortcuts & help', 'Atajos y ayuda')}</span>`;
+  searchInput.setAttribute('aria-label', tr('Search your bookmarks', 'Buscar en tus marcadores'));
   const langBtn = $('#btnLang');
   langBtn.textContent = languageButtonText();
   langBtn.title = languageButtonTitle();
@@ -1416,7 +2067,10 @@ async function init() {
   const params = new URLSearchParams(location.search);
   if (params.get('folder')) state.view = { type: 'folder', folderId: params.get('folder') };
   const q = params.get('q');
+  const saveTabs = params.get('saveTabs');
+  if (saveTabs) history.replaceState(null, '', location.pathname);
 
+  [recentCache, linkReport] = await Promise.all([recentFolders(), loadLinkReport()]);
   await refresh();
 
   if (state.expanded.size === 0) {
@@ -1425,6 +2079,7 @@ async function init() {
     renderTree();
   }
   if (q) { searchInput.value = q; setQuery(q); }
+  if (saveTabs) modalSaveTabs(saveTabs);
 
   bm.onAny(debounce(refresh, 250));
 
@@ -1433,4 +2088,4 @@ async function init() {
   }
 }
 
-init();
+init().catch(err => toast(errMsg(err), { kind: 'err', icon: 'alert', duration: 10000 }));

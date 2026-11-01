@@ -6,7 +6,7 @@
   --border-strong: #d4d8e0;
   --text: #181b22;
   --text-2: #5c6472;
-  --text-3: #98a1b0;
+  --text-3: #687487;
   --accent: #4f46e5;
   --accent-soft: #eef0ff;
   --accent-soft-2: #e0e4ff;
@@ -22,7 +22,7 @@
   --border-strong: #333a49;
   --text: #e8ebf1;
   --text-2: #a4adbc;
-  --text-3: #67707f;
+  --text-3: #909bad;
   --accent: #818cf8;
   --accent-soft: rgba(129, 140, 248, .13);
   --accent-soft-2: rgba(129, 140, 248, .24);
@@ -33,7 +33,7 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 [hidden] { display: none !important; }
 body {
-  width: 384px;
+  width: 400px;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui, Roboto, sans-serif;
   font-size: 13.5px;
   color: var(--text);
@@ -58,7 +58,7 @@ mark { background: var(--mark-bg); color: inherit; border-radius: 3px; padding: 
 #search { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; font-size: 13.5px; color: inherit; }
 #search::placeholder { color: var(--text-3); }
 
-#body { max-height: 484px; overflow-y: auto; overflow-x: hidden; padding: 0 8px 8px; }
+#body { max-height: 405px; overflow-y: auto; overflow-x: hidden; padding: 0 8px 8px; }
 ::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 8px; }
 
@@ -110,7 +110,7 @@ mark { background: var(--mark-bg); color: inherit; border-radius: 3px; padding: 
 #currentPage {
   margin: 4px 4px 0;
   padding: 9px 10px;
-  display: flex; align-items: center; gap: 10px;
+  display: flex; flex-direction: column; gap: 8px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -153,3 +153,33 @@ footer {
   padding: 6px 10px; border-radius: 8px;
 }
 .btn-open:hover { background: var(--accent-soft); }
+
+.popup-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px 0; }
+.popup-brand { display: flex; align-items: center; gap: 4px; font-size: 14px; font-weight: 600; letter-spacing: -.3px; }
+.popup-brand b { color: var(--accent); }
+.brand-mark { display: inline-grid; place-items: center; color: white; background: var(--grad); border-radius: 7px; width: 24px; height: 24px; margin-right: 5px; }
+#popupViews { display: flex; gap: 4px; padding: 2px 12px 10px; }
+#popupViews button { display: flex; align-items: center; gap: 6px; border-radius: 7px; padding: 6px 12px; font-size: 12px; color: var(--text-2); }
+#popupViews button[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+#popupViews button:hover { color: var(--accent); }
+.current-summary { display: flex; align-items: center; gap: 10px; width: 100%; }
+.current-summary .fav { flex-shrink: 0; }
+.fav { display: inline-flex; width: var(--fav-size, 20px); height: var(--fav-size, 20px); flex-shrink: 0; }
+.fav img { width: 100%; height: 100%; object-fit: contain; border-radius: 4px; }
+.edit-current { width: 100%; text-align: left; color: var(--accent); font-size: 11.5px; padding: 4px 0 0 30px; }
+.edit-current:hover { text-decoration: underline; }
+.current-editor { display: flex; flex-direction: column; gap: 7px; width: 100%; }
+.current-editor .fp { --fp-height: 150px; }
+.current-editor .fp-list { background: var(--bg); }
+.current-editor input, .current-editor select { width: 100%; min-width: 0; height: 33px; padding: 0 9px; border: 1px solid var(--border-strong); border-radius: 7px; font: inherit; color: inherit; background: var(--bg); }
+.editor-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.editor-actions button { padding: 6px 12px; border-radius: 7px; font-size: 12px; }
+.save-current { color: white; background: #4f46e5; }
+.editor-actions button:hover { filter: brightness(1.15); }
+#notice { display: flex; align-items: center; gap: 10px; padding: 9px 14px; background: var(--accent-soft); border-top: 1px solid var(--border); font-size: 12px; }
+#notice span { flex: 1; overflow-wrap: anywhere; }
+#notice button { color: var(--accent); font-weight: 650; }
+button:disabled { opacity: .5; cursor: wait; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.icon-mini:hover, .icon-mini:focus-visible { color: var(--accent); background: var(--accent-soft); }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }

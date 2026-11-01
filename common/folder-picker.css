@@ -1,0 +1,40 @@
+/* Selector de carpetas compartido (administrador, popup y ventana de guardado).
+   Usa los tokens de color de la página que lo incluye. */
+.fp { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.fp-recent { display: flex; flex-wrap: wrap; gap: 5px; }
+.fp-filter {
+  width: 100%; height: 36px; padding: 0 11px;
+  border: 1px solid var(--border-strong); border-radius: 8px;
+  background: var(--surface); color: inherit; font: inherit; outline: none;
+  transition: border-color .12s, box-shadow .12s;
+}
+.fp-filter:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft-2); }
+.fp .fp-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  height: 24px; max-width: 160px; padding: 0 9px;
+  border: 1px solid var(--border); border-radius: 20px;
+  background: var(--surface); color: var(--text-2);
+  font: inherit; font-size: 11.5px; font-weight: 500; cursor: pointer;
+  transition: color .12s, background .12s, border-color .12s;
+}
+.fp .fp-chip span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fp .fp-chip:hover, .fp .fp-chip[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft-2); }
+.fp .fp-chip:active { transform: none; }
+.fp-list {
+  position: relative;
+  height: var(--fp-height, 176px); overflow-y: auto;
+  border: 1px solid var(--border-strong); border-radius: 8px;
+  background: var(--surface); padding: 4px;
+}
+.fp-row {
+  display: flex; align-items: center; gap: 7px;
+  height: 29px; padding: 0 8px; border-radius: 6px;
+  color: var(--text-2); cursor: pointer; user-select: none;
+  font-size: 13px; white-space: nowrap;
+}
+.fp-row:hover { background: var(--surface-2); color: var(--text); }
+.fp-row.selected { background: var(--accent-soft-2); color: var(--accent); font-weight: 600; }
+.fp-row[aria-disabled="true"] { opacity: .4; cursor: not-allowed; }
+.fp-title { overflow: hidden; text-overflow: ellipsis; flex: none; max-width: 70%; }
+.fp-path { overflow: hidden; text-overflow: ellipsis; font-size: 11.5px; color: var(--text-3); font-weight: 400; min-width: 0; }
+.fp-empty { padding: 18px 8px; text-align: center; font-size: 12.5px; color: var(--text-3); }

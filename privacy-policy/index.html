@@ -98,7 +98,7 @@
 
       <article>
         <h1>Privacy Policy</h1>
-        <p class="date">Effective date: July 31, 2026</p>
+        <p class="date">Effective date: November 1, 2026</p>
 
         <p class="summary">
           <strong>Mark My Tabs does not collect, sell, share, or transmit personal data.</strong>
@@ -110,9 +110,11 @@
         <p>Mark My Tabs accesses the following information only as required for its functionality:</p>
         <ul>
           <li>Chrome bookmark titles, URLs, folder names, folder structure, and bookmark dates.</li>
-          <li>The active tab's title and URL when the user explicitly saves or removes that page.</li>
+          <li>The active tab's title and URL when the user explicitly saves or removes that page, or the address of a link the user chooses to save from the right-click menu.</li>
+          <li>The titles and URLs of the tabs in a window, only when the user chooses "Save open tabs" and grants the optional tabs permission.</li>
           <li>Favicons already available through Chrome for displaying bookmark icons.</li>
-          <li>Local preferences such as language, theme, view settings, expanded folders, and the last selected save folder.</li>
+          <li>Local preferences such as language, theme, view settings, expanded folders, and recently used folders.</li>
+          <li>The result of the most recent broken-link check (affected URLs and their response status), stored locally.</li>
           <li>Temporary tab or window identifiers used to avoid opening duplicate extension pages.</li>
         </ul>
 
@@ -129,6 +131,13 @@
           are stored locally in the browser using Chrome extension storage or local storage. Mark My
           Tabs has no backend, external database, analytics service, advertising service, or user
           account system. The developer does not receive this information.
+        </p>
+        <p>
+          <strong>Broken-link check (optional).</strong> Only when the user starts a link check and grants
+          the optional site-access permission, Mark My Tabs sends a request directly to each saved
+          http/https address to see whether it still responds. These requests go only to the sites the
+          user has bookmarked, carry no cookies or referrer, and no data is sent to the developer or any
+          other party. The permission can be revoked at any time from Chrome's extension settings.
         </p>
 
         <h2>Sharing and sale of data</h2>
@@ -151,6 +160,10 @@
           <li><strong>activeTab:</strong> access the current page's title and URL only after the user invokes the extension.</li>
           <li><strong>favicon:</strong> display bookmark favicons through Chrome's built-in favicon service.</li>
           <li><strong>storage:</strong> remember extension preferences and temporary extension state.</li>
+          <li><strong>contextMenus:</strong> add "Save page", "Save link" and "Save all tabs" to Chrome's right-click menu.</li>
+          <li><strong>tabGroups:</strong> name the tab group when the user opens a folder as a tab group.</li>
+          <li><strong>tabs (optional, requested on use):</strong> read the titles and URLs of open tabs when the user saves all tabs to a folder.</li>
+          <li><strong>Site access for http/https (optional, requested on use):</strong> check whether saved links still work when the user runs a link check.</li>
         </ul>
 
         <h2>Changes to this policy</h2>

@@ -5,22 +5,33 @@
   <title>Mark My Tabs</title>
   <script src="../common/theme.js"></script>
   <link rel="stylesheet" href="popup.css">
+  <link rel="stylesheet" href="../common/folder-picker.css">
 </head>
 <body>
+  <header class="popup-header">
+    <span class="popup-brand"><span class="brand-mark">▰</span> Mark My <b>Tabs</b></span>
+    <button id="btnTheme" class="icon-mini" type="button"></button>
+  </header>
   <div id="searchBar">
     <span class="search-icn"></span>
     <input id="search" type="text" placeholder="Search your bookmarks…" data-i18n-placeholder="searchBookmarks" autocomplete="off" spellcheck="false" autofocus>
+    <button id="btnClear" class="icon-mini" type="button" hidden></button>
   </div>
+
+  <nav id="popupViews"></nav>
 
   <div id="body">
     <div id="currentPage" hidden></div>
     <div id="results"></div>
   </div>
 
+  <div id="notice" role="status" hidden></div>
+
   <footer>
     <span id="total"></span>
     <span class="foot-actions">
       <button id="btnLang" class="lang-mini" type="button"></button>
+      <button id="btnSaveTabs" class="icon-mini" type="button"></button>
       <button id="btnCollapse" class="icon-mini" title="Collapse folders" data-i18n-title="collapseFolders"></button>
       <button id="btnManager" class="btn-open"></button>
     </span>

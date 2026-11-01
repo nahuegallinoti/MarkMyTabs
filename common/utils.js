@@ -1,5 +1,10 @@
 import { createMockBookmarks } from './mock.js';
 import { getLocale, tr } from './i18n.js';
+import { domainOf } from './search.js';
+
+export {
+  escapeHtml, normalize, domainOf, tokenize, searchScore, parseQuery, queryScore, highlight,
+} from './search.js';
 
 export const IS_EXT = typeof chrome !== 'undefined' && !!chrome.bookmarks && !!chrome.runtime?.id;
 
@@ -56,6 +61,16 @@ const PATHS = {
   sparkles: '<path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z"/><path d="M19 17v4M17 19h4"/>',
   alert: '<path d="M12 9v4"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="10"/>',
   info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',
+  upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 8l5-5 5 5M12 3v12"/>',
+  pin: '<path d="m16 3 5 5-4 1-3 5-1 4-7-7 4-1 5-3 1-4ZM2 22l6-6"/>',
+  layers: '<path d="m12 2 10 5-10 5L2 7Z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/>',
+  link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  unlink: '<path d="m18.84 12.25 1.72-1.71a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="m5.17 11.75-1.71 1.71a5 5 0 0 0 7.07 7.07l1.71-1.71"/><path d="M8 2v3M2 8h3M16 22v-3M22 16h-3"/>',
+  sortAZ: '<path d="m3 16 4 4 4-4M7 20V4"/><path d="M15 4h5l-5 6h5"/><path d="M15 20v-3.5a2.5 2.5 0 0 1 5 0V20M15 18h5"/>',
+  refresh: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>',
+  folderX: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/><path d="m9.5 10.5 5 5M14.5 10.5l-5 5"/>',
+  shuffle: '<path d="M2 18h1.4c1.3 0 2.5-.6 3.3-1.7l6.1-8.6c.7-1.1 2-1.7 3.3-1.7H22"/><path d="m18 2 4 4-4 4"/><path d="M2 6h1.9c1.5 0 2.9.9 3.6 2.2"/><path d="M22 18h-5.9c-1.3 0-2.6-.7-3.3-1.8l-.5-.8"/><path d="m18 14 4 4-4 4"/>',
 };
 
 export function svg(name, size = 18) {
@@ -67,17 +82,57 @@ export function icon(name, size = 18) {
 }
 
 // ---------- Texto ----------
-export function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+export function normalizeUrl(value, { addScheme = true } = {}) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const parse = s => {
+    try {
+      const u = new URL(s);
+      return ['http:', 'https:', 'ftp:', 'file:', 'chrome:', 'edge:', 'about:'].includes(u.protocol) ? u.href : null;
+    } catch { return null; }
+  };
+  if (/^[a-z][a-z\d+.-]*:/i.test(raw) && !/^[\w.-]+:\d+(?:\/|$)/.test(raw)) return parse(raw);
+  if (!addScheme || /\s/.test(raw)) return null;
+  const candidate = parse('https://' + raw);
+  return candidate && (new URL(candidate).hostname.includes('.') || new URL(candidate).hostname === 'localhost') ? candidate : null;
 }
 
-export function normalize(s) {
-  return String(s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+// URL already normalizes hosts, default ports, and encoding. Paths and fragments
+// remain case-sensitive, including YouTube timestamps and document anchors.
+export function bookmarkUrlKey(url) {
+  try { return new URL(url).href; } catch { return url; }
 }
 
-export function domainOf(url) {
-  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return url || ''; }
+export async function lastSaveFolder() {
+  if (IS_EXT) {
+    try { return (await chrome.storage.local.get('lastSaveFolder')).lastSaveFolder; }
+    catch { return null; }
+  }
+  return loadPref('mp-last-save-folder', null);
 }
+
+export async function recentFolders() {
+  if (IS_EXT) {
+    try { return (await chrome.storage.local.get('recentFolders')).recentFolders || []; }
+    catch { return []; }
+  }
+  return loadPref('mp-recent-folders', []);
+}
+
+// Carpetas usadas hace poco (guardar, mover, importar): se ofrecen como atajos.
+export async function rememberFolder(id, { asSaveDefault = false } = {}) {
+  if (!id) return;
+  const recent = [id, ...(await recentFolders()).filter(x => x !== id)].slice(0, 8);
+  if (IS_EXT) {
+    try { await chrome.storage.local.set({ recentFolders: recent, ...(asSaveDefault ? { lastSaveFolder: id } : {}) }); }
+    catch { /* A preference failure must not turn a successful bookmark write into a retry. */ }
+  } else {
+    savePref('mp-recent-folders', recent);
+    if (asSaveDefault) savePref('mp-last-save-folder', id);
+  }
+}
+
+export const rememberSaveFolder = (id) => rememberFolder(id, { asSaveDefault: true });
 
 export const fmtNum = (n) => new Intl.NumberFormat(getLocale()).format(n);
 
@@ -102,57 +157,6 @@ export function fullDate(ts) {
 export function debounce(fn, ms) {
   let t;
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
-}
-
-// ---------- Búsqueda ----------
-export function tokenize(query) {
-  return normalize(query).split(/\s+/).filter(Boolean);
-}
-
-// Puntúa un nodo contra los tokens; devuelve -1 si no matchea todos
-export function searchScore(node, tokens) {
-  const title = normalize(node.title || '');
-  const url = normalize(node.url || '');
-  const domain = node.url ? normalize(domainOf(node.url)) : '';
-  let score = 0;
-  for (const t of tokens) {
-    const it = title.indexOf(t);
-    const iu = url.indexOf(t);
-    if (it === -1 && iu === -1) return -1;
-    if (it === 0) score += 60;
-    else if (it > 0 && /[\s\-_./|:]/.test(title[it - 1] || '')) score += 40;
-    else if (it > 0) score += 20;
-    if (domain.startsWith(t)) score += 25;
-    else if (iu !== -1) score += 8;
-  }
-  if (!node.url) score += 5; // las carpetas que matchean, un poco arriba
-  return score;
-}
-
-// Resalta ocurrencias de los tokens (devuelve HTML seguro)
-export function highlight(text, tokens) {
-  const raw = String(text);
-  if (!tokens?.length) return escapeHtml(raw);
-  const norm = normalize(raw);
-  const marks = new Array(raw.length).fill(false);
-  for (const t of tokens) {
-    let from = 0;
-    while (true) {
-      const i = norm.indexOf(t, from);
-      if (i === -1) break;
-      for (let j = i; j < Math.min(i + t.length, raw.length); j++) marks[j] = true;
-      from = i + t.length;
-    }
-  }
-  let out = '';
-  let open = false;
-  for (let i = 0; i < raw.length; i++) {
-    if (marks[i] && !open) { out += '<mark>'; open = true; }
-    if (!marks[i] && open) { out += '</mark>'; open = false; }
-    out += escapeHtml(raw[i]);
-  }
-  if (open) out += '</mark>';
-  return out;
 }
 
 // ---------- Favicons ----------
@@ -230,10 +234,32 @@ export const bm = IS_EXT ? realApi() : createMockBookmarks();
 
 // ---------- Pestañas ----------
 export function openUrl(url, { active = true } = {}) {
-  if (IS_EXT && chrome.tabs?.create) chrome.tabs.create({ url, active });
-  else window.open(url, '_blank');
+  if (!normalizeUrl(url, { addScheme: false })) return;
+  if (IS_EXT && chrome.tabs?.create) return chrome.tabs.create({ url, active });
+  else window.open(url, '_blank', 'noopener');
 }
 export function openInWindow(url) {
+  if (!normalizeUrl(url, { addScheme: false })) return;
   if (IS_EXT && chrome.windows?.create) chrome.windows.create({ url });
   else window.open(url, '_blank', 'noopener,width=1100,height=800');
+}
+
+// Abre varias URLs: en segundo plano, en una ventana nueva o como grupo de pestañas con nombre.
+export async function openUrls(urls, { newWindow = false, group = null } = {}) {
+  const safe = urls.filter(u => normalizeUrl(u, { addScheme: false }));
+  if (!safe.length) return;
+  if (!IS_EXT) { for (const u of safe) window.open(u, '_blank', 'noopener'); return; }
+  let tabIds;
+  if (newWindow) {
+    const win = await chrome.windows.create({ url: safe, focused: true });
+    tabIds = (win.tabs || []).map(t => t.id);
+  } else {
+    tabIds = [];
+    for (const url of safe) tabIds.push((await chrome.tabs.create({ url, active: false })).id);
+  }
+  if (group && tabIds.length && chrome.tabs.group) {
+    const groupId = await chrome.tabs.group({ tabIds });
+    await chrome.tabGroups?.update(groupId, { title: String(group).slice(0, 80) }).catch(() => {});
+    if (!newWindow) await chrome.tabs.update(tabIds[0], { active: true }).catch(() => {});
+  }
 }

@@ -17,13 +17,16 @@ const TYPES = {
 };
 
 http.createServer((req, res) => {
-  let p = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
-  if (p === '/') p = '/manager/manager.html';
+  let p;
+  try { p = decodeURIComponent(new URL(req.url, 'http://localhost').pathname); }
+  catch { res.writeHead(400); res.end(); return; }
+  if (p === '/') { res.writeHead(302, { Location: '/manager/manager.html' }); res.end(); return; }
   const file = path.join(ROOT, p);
-  if (!file.startsWith(ROOT)) { res.writeHead(403); res.end(); return; }
+  const relative = path.relative(ROOT, file);
+  if (relative.startsWith('..') || path.isAbsolute(relative) || relative.split(path.sep).some(part => part.startsWith('.'))) { res.writeHead(403); res.end(); return; }
   fs.readFile(file, (err, data) => {
     if (err) { res.writeHead(404); res.end('404'); return; }
     res.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream' });
     res.end(data);
   });
-}).listen(PORT, () => console.log(`dev server en http://localhost:${PORT}`));
+}).listen(PORT, '127.0.0.1', () => console.log(`dev server en http://localhost:${PORT}`));
